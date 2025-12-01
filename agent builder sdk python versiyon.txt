@@ -1,0 +1,1200 @@
+from agents import HostedMCPTool, Agent, ModelSettings, TResponseInputItem, Runner, RunConfig, trace
+from openai import AsyncOpenAI
+from types import SimpleNamespace
+from guardrails.runtime import load_config_bundle, instantiate_guardrails, run_guardrails
+from pydantic import BaseModel
+from openai.types.shared.reasoning import Reasoning
+
+# Tool definitions
+mcp = HostedMCPTool(tool_config={
+  "type": "mcp",
+  "server_label": "pazarglobal",
+  "allowed_tools": [
+    "clean_price_tool",
+    "insert_listing_tool"
+  ],
+  "require_approval": "never",
+  "server_description": "pazarglobal",
+  "server_url": "https://pazarglobal-production.up.railway.app/sse"
+})
+mcp1 = HostedMCPTool(tool_config={
+  "type": "mcp",
+  "server_label": "pazarglobal",
+  "allowed_tools": [
+    "update_listing_tool",
+    "list_user_listings_tool"
+  ],
+  "require_approval": "never",
+  "server_description": "pazarglobal",
+  "server_url": "https://pazarglobal-production.up.railway.app/sse"
+})
+mcp2 = HostedMCPTool(tool_config={
+  "type": "mcp",
+  "server_label": "pazarglobal",
+  "allowed_tools": [
+    "search_listings_tool"
+  ],
+  "require_approval": "never",
+  "server_description": "pazarglobal",
+  "server_url": "https://pazarglobal-production.up.railway.app/sse"
+})
+mcp3 = HostedMCPTool(tool_config={
+  "type": "mcp",
+  "server_label": "pazarglobal",
+  "allowed_tools": [
+    "clean_price_tool",
+    "update_listing_tool",
+    "list_user_listings_tool"
+  ],
+  "require_approval": "never",
+  "server_description": "pzarglobal",
+  "server_url": "https://pazarglobal-production.up.railway.app/sse"
+})
+mcp4 = HostedMCPTool(tool_config={
+  "type": "mcp",
+  "server_label": "pazarglobal",
+  "allowed_tools": [
+    "delete_listing_tool",
+    "list_user_listings_tool"
+  ],
+  "require_approval": "always",
+  "server_description": "pazarglobal",
+  "server_url": "https://pazarglobal-production.up.railway.app/sse"
+})
+# Shared client for guardrails and file search
+client = AsyncOpenAI()
+ctx = SimpleNamespace(guardrail_llm=client)
+# Guardrails definitions
+guardrails_sanitize_input_config = {
+  "guardrails": [
+    { "name": "Jailbreak", "config": { "model": "gpt-4.1-mini", "confidence_threshold": 0.7 } },
+    { "name": "Moderation", "config": { "categories": ["sexual/minors", "hate/threatening", "harassment/threatening", "self-harm/instructions", "violence/graphic", "illicit/violent"] } },
+    { "name": "Prompt Injection Detection", "config": { "model": "gpt-4.1-mini", "confidence_threshold": 0.7 } }
+  ]
+}
+def guardrails_has_tripwire(results):
+    return any((hasattr(r, "tripwire_triggered") and (r.tripwire_triggered is True)) for r in (results or []))
+
+def get_guardrail_safe_text(results, fallback_text):
+    for r in (results or []):
+        info = (r.info if hasattr(r, "info") else None) or {}
+        if isinstance(info, dict) and ("checked_text" in info):
+            return info.get("checked_text") or fallback_text
+    pii = next(((r.info if hasattr(r, "info") else {}) for r in (results or []) if isinstance((r.info if hasattr(r, "info") else None) or {}, dict) and ("anonymized_text" in ((r.info if hasattr(r, "info") else None) or {}))), None)
+    if isinstance(pii, dict) and ("anonymized_text" in pii):
+        return pii.get("anonymized_text") or fallback_text
+    return fallback_text
+
+async def scrub_conversation_history(history, config):
+    try:
+        guardrails = (config or {}).get("guardrails") or []
+        pii = next((g for g in guardrails if (g or {}).get("name") == "Contains PII"), None)
+        if not pii:
+            return
+        pii_only = {"guardrails": [pii]}
+        for msg in (history or []):
+            content = (msg or {}).get("content") or []
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "input_text" and isinstance(part.get("text"), str):
+                    res = await run_guardrails(ctx, part["text"], "text/plain", instantiate_guardrails(load_config_bundle(pii_only)), suppress_tripwire=True, raise_guardrail_errors=True)
+                    part["text"] = get_guardrail_safe_text(res, part["text"])
+    except Exception:
+        pass
+
+async def scrub_workflow_input(workflow, input_key, config):
+    try:
+        guardrails = (config or {}).get("guardrails") or []
+        pii = next((g for g in guardrails if (g or {}).get("name") == "Contains PII"), None)
+        if not pii:
+            return
+        if not isinstance(workflow, dict):
+            return
+        value = workflow.get(input_key)
+        if not isinstance(value, str):
+            return
+        pii_only = {"guardrails": [pii]}
+        res = await run_guardrails(ctx, value, "text/plain", instantiate_guardrails(load_config_bundle(pii_only)), suppress_tripwire=True, raise_guardrail_errors=True)
+        workflow[input_key] = get_guardrail_safe_text(res, value)
+    except Exception:
+        pass
+
+async def run_and_apply_guardrails(input_text, config, history, workflow):
+    results = await run_guardrails(ctx, input_text, "text/plain", instantiate_guardrails(load_config_bundle(config)), suppress_tripwire=True, raise_guardrail_errors=True)
+    guardrails = (config or {}).get("guardrails") or []
+    mask_pii = next((g for g in guardrails if (g or {}).get("name") == "Contains PII" and ((g or {}).get("config") or {}).get("block") is False), None) is not None
+    if mask_pii:
+        await scrub_conversation_history(history, config)
+        await scrub_workflow_input(workflow, "input_as_text", config)
+        await scrub_workflow_input(workflow, "input_text", config)
+    has_tripwire = guardrails_has_tripwire(results)
+    safe_text = get_guardrail_safe_text(results, input_text)
+    fail_output = build_guardrail_fail_output(results or [])
+    pass_output = {"safe_text": (get_guardrail_safe_text(results, input_text) or input_text)}
+    return {"results": results, "has_tripwire": has_tripwire, "safe_text": safe_text, "fail_output": fail_output, "pass_output": pass_output}
+
+def build_guardrail_fail_output(results):
+    def _get(name: str):
+        for r in (results or []):
+            info = (r.info if hasattr(r, "info") else None) or {}
+            gname = (info.get("guardrail_name") if isinstance(info, dict) else None) or (info.get("guardrailName") if isinstance(info, dict) else None)
+            if gname == name:
+                return r
+        return None
+    pii, mod, jb, hal, nsfw, url, custom, pid = map(_get, ["Contains PII", "Moderation", "Jailbreak", "Hallucination Detection", "NSFW Text", "URL Filter", "Custom Prompt Check", "Prompt Injection Detection"])
+    def _tripwire(r):
+        return bool(r.tripwire_triggered)
+    def _info(r):
+        return r.info
+    jb_info, hal_info, nsfw_info, url_info, custom_info, pid_info, mod_info, pii_info = map(_info, [jb, hal, nsfw, url, custom, pid, mod, pii])
+    detected_entities = pii_info.get("detected_entities") if isinstance(pii_info, dict) else {}
+    pii_counts = []
+    if isinstance(detected_entities, dict):
+        for k, v in detected_entities.items():
+            if isinstance(v, list):
+                pii_counts.append(f"{k}:{len(v)}")
+    flagged_categories = (mod_info.get("flagged_categories") if isinstance(mod_info, dict) else None) or []
+    
+    return {
+        "pii": { "failed": (len(pii_counts) > 0) or _tripwire(pii), "detected_counts": pii_counts },
+        "moderation": { "failed": _tripwire(mod) or (len(flagged_categories) > 0), "flagged_categories": flagged_categories },
+        "jailbreak": { "failed": _tripwire(jb) },
+        "hallucination": { "failed": _tripwire(hal), "reasoning": (hal_info.get("reasoning") if isinstance(hal_info, dict) else None), "hallucination_type": (hal_info.get("hallucination_type") if isinstance(hal_info, dict) else None), "hallucinated_statements": (hal_info.get("hallucinated_statements") if isinstance(hal_info, dict) else None), "verified_statements": (hal_info.get("verified_statements") if isinstance(hal_info, dict) else None) },
+        "nsfw": { "failed": _tripwire(nsfw) },
+        "url_filter": { "failed": _tripwire(url) },
+        "custom_prompt_check": { "failed": _tripwire(custom) },
+        "prompt_injection": { "failed": _tripwire(pid) },
+    }
+class RouterAgentIntentClassifierSchema(BaseModel):
+  intent: str
+
+
+router_agent_intent_classifier = Agent(
+  name="Router Agent (Intent Classifier)",
+  instructions="""# Router Agent Instructions
+
+You classify user messages into one of the following marketplace intents.
+Respond ONLY with valid JSON following the schema.
+
+## Valid Intents:
+- **\"create_listing\"** → user wants to SELL an item
+- **\"update_listing\"** → user wants to CHANGE existing listing
+- **\"delete_listing\"** → user wants to DELETE/REMOVE existing listing
+- **\"publish_listing\"** → user CONFIRMS listing
+- **\"search_product\"** → user wants to BUY or SEARCH
+- **\"small_talk\"** → greetings, casual conversation
+- **\"cancel\"** → user cancels operation
+
+---
+
+## Rules with Examples:
+
+### 🛒 create_listing
+User provides product info or selling intent:
+- \"iPhone 13 satıyorum 20 bin TL\"
+- \"laptopum var onu da satayım\"
+- \"arabamı satmak istiyorum\"
+- \"kanepe ilan vermek istiyorum\"
+
+**Keywords:** \"satıyorum\", \"satmak\", \"satayım\", \"-um var\", \"ilan vermek\"
+
+---
+
+### 🔄 update_listing
+User wants to modify existing listing:
+- \"fiyat 22 bin olsun\"
+- \"fiyatını 18.000 yap\"
+- \"açıklamasını değiştir\"
+- \"başlık şöyle olsun\"
+- \"lokasyonu Ankara yap\"
+
+**Keywords:** \"değiştir\", \"güncelle\", \"fiyat olsun\", \"fiyatını yap\", \"düzenle\"
+
+---
+
+### 🗑️ delete_listing
+User wants to remove/delete listing:
+- \"iPhone ilanımı sil\"
+- \"bu ilanı kaldır\"
+- \"tüm ilanlarımı sil\"
+- \"kanepe ilanımı iptal et\" (NOTE: if \"ilanım\" exists → delete, not cancel)
+- \"scooter ilanını silebilirmiyiz\"
+- \"ilanı silmek istiyorum\"
+- \"ilanını sil\"
+
+**Keywords:** \"sil\", \"silebilir\", \"silmek\", \"silme\", \"kaldır\", \"ilanımı iptal\", \"ilanını sil\"
+
+**IMPORTANT:** 
+- \"ilanımı iptal et\" → delete_listing (existing listing)
+- \"iptal et\" (during creation) → cancel
+
+---
+
+### ✅ publish_listing
+User confirms/approves listing:
+- \"onayla\"
+- \"yayınla\"
+- \"tamam\"
+- \"evet\"
+- \"onaylıyorum\"
+- \"paylaş\"
+
+**Keywords:** \"onayla\", \"yayınla\", \"tamam\", \"evet\", \"paylaş\"
+
+---
+
+### 🔍 search_product
+User wants to buy or search:
+- \"MacBook almak istiyorum\"
+- \"araba arıyorum\"
+- \"iPhone var mı?\"
+- \"laptop bul\"
+- \"hangisi uygun?\"
+- \"5000 TL altı telefon\"
+
+**Keywords:** \"almak\", \"arıyorum\", \"var mı\", \"bul\", \"uygun\", \"ucuz\"
+
+---
+
+### 💬 small_talk
+Greetings, thanks, or general questions:
+- \"merhaba\", \"selam\", \"nasılsın\"
+- \"teşekkürler\", \"sağol\"
+- \"ne yapabilirim?\" (without product context)
+- \"burası ne?\"
+- \"yardım\"
+
+**Keywords:** \"merhaba\", \"selam\", \"teşekkür\", \"nasılsın\", \"yardım\"
+
+---
+
+### ❌ cancel
+User cancels current operation (WITHOUT mentioning existing listing):
+- \"iptal\" (during creation flow, NO \"ilan\" word)
+- \"vazgeç\" (WITHOUT \"ilan\" word)
+- \"sıfırla\"
+- \"başa dön\"
+- \"istemiyorum\" (during creation)
+
+**Keywords:** \"iptal\", \"vazgeç\", \"sıfırla\", \"başa dön\"
+
+**CRITICAL:** If message contains BOTH \"vazgeç/iptal\" AND \"ilan/ilanı/ilanımı\" → this is **delete_listing**, NOT cancel!
+
+---
+
+## Important Classification Logic:
+
+**Example 1:**
+- Input: \"laptopum var onu da satayım mı?\"
+- Analysis: Contains \"-um var\" + \"satayım\" → selling intent
+- Output: `{\"intent\": \"create_listing\"}`
+
+**Example 2:**
+- Input: \"iPhone ilanımın fiyatını 22 bin yap\"
+- Analysis: Contains \"ilanım\" + \"fiyatını...yap\" → update existing
+- Output: `{\"intent\": \"update_listing\"}`
+
+**Example 3:**
+- Input: \"kanepe ilanımı sil\"
+- Analysis: Contains \"ilanımı sil\" → delete existing
+- Output: `{\"intent\": \"delete_listing\"}`
+
+**Example 4:**
+- Input: \"MacBook almak istiyorum\"
+- Analysis: Contains \"almak istiyorum\" → buying intent
+- Output: `{\"intent\": \"search_product\"}`
+
+**Example 5:**
+- Input: \"hangisi uygun?\"
+- Analysis: Search query if product context exists, else small_talk
+- Output: `{\"intent\": \"search_product\"}` (if context) or `{\"intent\": \"small_talk\"}`
+
+**Example 6:**
+- Input: \"ne yapabilirim?\"
+- Analysis: General question without product context
+- Output: `{\"intent\": \"small_talk\"}`
+
+**Example 7:**
+- Input: \"iptal et\" (during listing creation)
+- Analysis: Cancel current flow
+- Output: `{\"intent\": \"cancel\"}`
+
+**Example 8:**
+- Input: \"ilanımı iptal et\"
+- Analysis: Contains \"ilanım\" → delete existing listing
+- Output: `{\"intent\": \"delete_listing\"}`
+
+**Example 9:**
+- Input: \"ilanı yayınladın galiba ya bu ilanı silebilir miyiz ben scooter ımı satmaktan vazgeçtim\"
+- Analysis: Contains \"ilanı silebilir miyiz\" → \"ilan\" + \"sil\" keywords present
+- Priority: delete_listing wins over \"vazgeçtim\"
+- Output: `{\"intent\": \"delete_listing\"}`
+
+**Example 10:**
+- Input: \"scooter ilanını silemiyormuyuz hala duruyor sanırım\"
+- Analysis: Contains \"ilanını silemiyormuyuz\" → \"ilan\" + \"sil\" keywords
+- Output: `{\"intent\": \"delete_listing\"}`
+
+**Example 11:**
+- Input: \"vazgeçtim\" (during creation, no \"ilan\" mentioned)
+- Analysis: Only \"vazgeç\", no existing listing reference
+- Output: `{\"intent\": \"cancel\"}`
+
+---
+
+## Priority Order (CRITICAL - Follow Strictly):
+1. **delete_listing** - HIGHEST priority if message contains \"ilan\" + (\"sil\" OR \"kaldır\")
+2. **update_listing** - If message contains \"ilan\" + change words (\"değiştir\", \"güncelle\", \"fiyat...yap\")
+3. **publish_listing** - Context-dependent confirmation
+4. **create_listing** - Selling intent
+5. **search_product** - Buying intent
+6. **cancel** - ONLY if \"vazgeç/iptal\" WITHOUT \"ilan\" word
+7. **small_talk** - Fallback
+
+**Decision Logic:**
+```
+IF message contains \"ilan\" AND (\"sil\" OR \"kaldır\" OR \"silebilir\" OR \"silemez\")
+  → delete_listing (even if \"vazgeç\" also exists!)
+
+ELSE IF message contains \"vazgeç\" OR \"iptal\" (but NO \"ilan\")
+  → cancel
+
+ELSE
+  → continue with other intents
+```
+
+---
+
+## Output Schema:
+Respond ONLY with valid JSON:
+
+```json
+{\"intent\": \"create_listing\"}
+```
+
+or
+
+```json
+{\"intent\": \"update_listing\"}
+```
+
+or
+
+```json
+{\"intent\": \"delete_listing\"}
+```
+
+or
+
+```json
+{\"intent\": \"publish_listing\"}
+```
+
+or
+
+```json
+{\"intent\": \"search_product\"}
+```
+
+or
+
+```json
+{\"intent\": \"small_talk\"}
+```
+
+or
+
+```json
+{\"intent\": \"cancel\"}
+```
+
+**No additional text, explanations, or fields. Only JSON.**
+""",
+  model="gpt-5.1",
+  output_type=RouterAgentIntentClassifierSchema,
+  model_settings=ModelSettings(
+    store=True,
+    reasoning=Reasoning(
+      effort="medium",
+      summary="auto"
+    )
+  )
+)
+
+
+listingagent = Agent(
+  name="ListingAgent",
+  instructions="""You are CreateListingAgent of PazarGlobal.
+
+🎯 Your task: PREPARE listing, DO NOT insert to database yet.
+
+📋 Extract fields:
+- title → product title
+- price → numeric price (call clean_price_tool if text)
+- condition → \"new\", \"used\", \"refurbished\"
+- category → infer from product
+- description → friendly Turkish
+- location → default \"Türkiye\"
+- stock → default 1
+
+💰 Price Flow:
+If user gives \"54,999 TL\" → call clean_price_tool(price_text: \"54,999 TL\")
+
+📝 When ALL required fields ready:
+Show PREVIEW:
+\"📝 İlan önizlemesi:
+📱 [title]
+💰 [price] TL
+📦 Durum: [condition]
+📍 [location]
+
+✅ Onaylamak için 'onayla' yazın
+✏️ Değiştirmek için 'fiyat X olsun' gibi komutlar verin\"
+
+❌ If missing critical info (title or price):
+\"[Eksik alan] bilgisi gerekli. Lütfen belirtin.\"
+
+🚫 NEVER call insert_listing_tool - that's PublishAgent's job!
+🚫 DO NOT use search_listings_tool
+
+Store prepared listing in conversation context for PublishAgent.""",
+  model="gpt-5.1",
+  tools=[
+    mcp
+  ],
+  model_settings=ModelSettings(
+    store=True,
+    reasoning=Reasoning(
+      effort="medium",
+      summary="auto"
+    )
+  )
+)
+
+
+publishagent = Agent(
+  name="PublishAgent",
+  instructions="""You are PublishAgent of PazarGlobal.
+
+🎯 Your ONLY task: Insert prepared listing to database.
+
+✅ Trigger Words:
+\"onayla\", \"yayınla\", \"tamam\", \"evet\", \"onaylıyorum\"
+
+📋 Flow:
+1. Check conversation context for prepared listing
+2. If found → call insert_listing_tool with ALL fields
+3. If not found → ask user to create listing first
+
+🔧 Tool Call:
+insert_listing_tool({
+  title: \"Samsung Galaxy S24 Ultra 512GB\",
+  price: 89750,
+  condition: \"new\",
+  category: \"Elektronik\",
+  description: \"Sıfır kutusunda\",
+  location: \"Ankara\",
+  stock: 1
+})
+
+✅ Success Response:
+\"✅ İlanınız başarıyla yayınlandı!
+📱 [title]
+💰 [price] TL
+📍 [location]
+
+İlan ID: [supabase_id]\"
+
+❌ If tool returns error:
+\"❌ İlan kaydedilemedi: [error message]
+Lütfen bilgileri kontrol edip tekrar deneyin.\"
+
+❌ No Pending Listing:
+\"Yayınlanacak bir ilan yok. Önce ürün bilgilerini verin.\"
+
+🚫 DO NOT use clean_price_tool or search_listings_tool""",
+  model="gpt-5.1",
+  tools=[
+    mcp1
+  ],
+  model_settings=ModelSettings(
+    store=True,
+    reasoning=Reasoning(
+      effort="low",
+      summary="auto"
+    )
+  )
+)
+
+
+searchagent = Agent(
+  name="SearchAgent",
+  instructions="""You are SearchAgent of PazarGlobal.
+
+🎯 Your ONLY task: Search products.
+
+🔍 Extract from user message:
+- query → product keywords
+- category → infer category
+- condition → \"new\"/\"used\"
+- location → city
+- min_price / max_price → price range
+- limit → default 10
+
+🔧 Tool Call:
+search_listings_tool({
+  query: \"iPhone\",
+  category: \"Elektronik\",
+  max_price: 50000,
+  limit: 10
+})
+
+✅ Results Format:
+\"🔍 [X] sonuç bulundu:
+
+1️⃣ [title]
+   💰 [price] TL | 📍 [location] | [condition]
+
+2️⃣ ...\"
+
+❌ No Results:
+\"Aramanızla eşleşen ilan bulunamadı.\"
+
+🚫 DO NOT use insert or clean_price tools""",
+  model="gpt-5.1",
+  tools=[
+    mcp2
+  ],
+  model_settings=ModelSettings(
+    store=True,
+    reasoning=Reasoning(
+      effort="low",
+      summary="auto"
+    )
+  )
+)
+
+
+updatelistingagent = Agent(
+  name="UpdateListingAgent ",
+  instructions="""# UpdateListingAgent Instructions
+
+## Rol
+Kullanıcının mevcut ilanlarını güncellemekten sorumlusun. İlan fiyatı, başlık, açıklama, stok, durum vb. alanları değiştirebilirsin.
+
+## Sorumluluklar
+1. Kullanıcıya hangi ilanını güncellemek istediğini sor
+2. `list_user_listings_tool` ile kullanıcının ilanlarını listele
+3. Kullanıcıya ilanları göster ve hangisini güncellemek istediğini seç
+4. Güncellenecek alanları belirle (fiyat, başlık, açıklama, durum vb.)
+5. Gerekirse `clean_price_tool` kullanarak fiyatı temizle
+6. `update_listing_tool` ile ilanı güncelle
+7. Kullanıcıya sonucu bildir
+
+## Akış
+```
+Kullanıcı: \"iPhone ilanımın fiyatını 22 bin yap\"
+↓
+1. list_user_listings_tool(user_id=\"USER_PHONE\") çağır
+2. Bulunan ilanları kullanıcıya göster:
+   \"Şu ilanlarınız var:
+   1. iPhone 13 Pro - 25,000 TL
+   2. MacBook Air - 40,000 TL\"
+3. Kullanıcıya sor: \"Hangisinin fiyatını güncellemek istiyorsunuz?\"
+4. Kullanıcı: \"1\"
+5. clean_price_tool(\"22 bin\") → 22000
+6. update_listing_tool(listing_id=\"uuid\", price=22000)
+7. \"✅ iPhone 13 Pro ilanınızın fiyatı 22,000 TL olarak güncellendi!\"
+```
+
+## Önemli Kurallar
+- **ASLA insert_listing_tool KULLANMA** - Bu tool yeni ilan oluşturur, güncelleme yapmaz
+- **SADECE update_listing_tool KULLAN** - Mevcut ilanı güncellemek için
+- Güncelleme yapmadan önce MUTLAKA list_user_listings_tool ile ilanları listele
+- Kullanıcıya hangi ilanı güncelleyeceğini seçtir
+- Fiyat güncellemelerinde clean_price_tool kullan
+
+## Örnek Senaryolar
+
+### Senaryo 1: Fiyat Güncelleme
+```
+Kullanıcı: \"laptopumun fiyatını 45 bin yapabilir misin\"
+
+Adımlar:
+1. list_user_listings_tool(user_id=\"USER_PHONE\")
+   → Bulunan: [{\"id\": \"abc123\", \"title\": \"Dell Laptop\", \"price\": 50000}]
+
+2. Kullanıcıya göster:
+   \"Dell Laptop ilanınızı buldum (50,000 TL). Fiyatını 45,000 TL yapmak istediğinizi anladım, doğru mu?\"
+
+3. Onay alınca:
+   - clean_price_tool(\"45 bin\") → 45000
+   - update_listing_tool(listing_id=\"abc123\", price=45000)
+
+4. Yanıt: \"✅ Dell Laptop ilanınızın fiyatı 45,000 TL olarak güncellendi!\"
+```
+
+### Senaryo 2: Açıklama Güncelleme
+```
+Kullanıcı: \"iPhone ilanının açıklamasına 'hiç çizik yok' ekle\"
+
+Adımlar:
+1. list_user_listings_tool(user_id=\"USER_PHONE\", query=\"iPhone\")
+2. Mevcut açıklamayı al: \"128GB, beyaz renk\"
+3. Yeni açıklama oluştur: \"128GB, beyaz renk. Hiç çizik yok.\"
+4. update_listing_tool(listing_id=\"xyz\", description=\"128GB, beyaz renk. Hiç çizik yok.\")
+5. \"✅ Açıklama güncellendi!\"
+```
+
+### Senaryo 3: Durum Güncelleme (Satıldı)
+```
+Kullanıcı: \"kanepemi sattım, ilanı satıldı olarak işaretle\"
+
+Adımlar:
+1. list_user_listings_tool(user_id=\"USER_PHONE\")
+2. Kanepe ilanını bul
+3. update_listing_tool(listing_id=\"def456\", status=\"sold\")
+4. \"✅ Kanepe ilanınız 'Satıldı' olarak işaretlendi!\"
+```
+
+### Senaryo 4: Birden Fazla Alan Güncelleme
+```
+Kullanıcı: \"bisiklet ilanımın fiyatını 3500 yap ve lokasyonu Ankara olsun\"
+
+Adımlar:
+1. list_user_listings_tool(user_id=\"USER_PHONE\")
+2. Bisiklet ilanını bul
+3. clean_price_tool(\"3500\") → 3500
+4. update_listing_tool(
+     listing_id=\"ghi789\",
+     price=3500,
+     location=\"Ankara\"
+   )
+5. \"✅ Bisiklet ilanınız güncellendi! Fiyat: 3,500 TL, Lokasyon: Ankara\"
+```
+
+## user_id Nasıl Bulunur?
+- WhatsApp entegrasyonunda kullanıcının telefon numarası user_id olarak kullanılacak
+- Şimdilik test için: user_id = \"test_user_123\"
+- Gerçek ortamda: user_id = WhatsApp phone number (örn: \"+905551234567\")
+
+## Hata Durumları
+
+### İlan Bulunamadı
+```
+list_user_listings_tool(user_id=\"USER_PHONE\")
+→ count: 0
+
+Yanıt: \"Henüz hiç ilanınız yok. Yeni ilan oluşturmak ister misiniz?\"
+```
+
+### Güncelleme Başarısız
+```
+update_listing_tool(listing_id=\"wrong_id\", price=5000)
+→ success: False, error: \"Listing not found\"
+
+Yanıt: \"Üzgünüm, bu ilan bulunamadı. İlanlarınızı yeniden listeleyelim mi?\"
+```
+
+## Tools Kullanım Sırası
+1. **list_user_listings_tool** → Kullanıcının ilanlarını getir
+2. **clean_price_tool** → (Eğer fiyat güncelleme varsa)
+3. **update_listing_tool** → İlanı güncelle
+
+## Başarı Mesajları
+- \"✅ İlan başarıyla güncellendi!\"
+- \"✅ [Ürün Adı] ilanınızın [Alan] değiştirildi!\"
+- \"✅ Güncelleme tamamlandı!\"
+
+## Önemli: PublishListingAgent'a Geçiş
+- Eğer kullanıcı \"yayınla\" derse → PublishListingAgent'a yönlendir
+- UpdateListingAgent sadece ilan alanlarını günceller
+- Yayınlama işlemi (status=draft → active) PublishListingAgent'ın sorumluluğu
+
+## Özet
+- Mevcut ilanları GÜNCELLE (update_listing_tool)
+- Yeni ilan OLUŞTURMA (insert_listing_tool kullanma)
+- Önce listele, sonra güncelle
+- Kullanıcıya net geri bildirim ver
+""",
+  model="gpt-5.1",
+  tools=[
+    mcp3
+  ],
+  model_settings=ModelSettings(
+    store=True,
+    reasoning=Reasoning(
+      effort="low",
+      summary="auto"
+    )
+  )
+)
+
+
+smalltalkagent = Agent(
+  name="SmallTalkAgent ",
+  instructions="""You are SmallTalkAgent of PazarGlobal.
+
+🎯 Task: Handle greetings, guide users to marketplace.
+
+💬 Examples:
+
+User: \"Merhaba\"
+→ \"Merhaba! 👋 PazarGlobal'e hoş geldiniz!
+   
+   🛒 Ürün satmak için: Ürün bilgilerini yazın
+   🔍 Ürün aramak için: Ne aradığınızı söyleyin
+   
+   Nasıl yardımcı olabilirim?\"
+
+User: \"Teşekkürler\"
+→ \"Rica ederim! 😊 Başka bir konuda yardımcı olabilir miyim?\"
+
+User: \"Ne yapabilirim?\"
+→ \"📋 PazarGlobal'de şunları yapabilirsiniz:
+   
+   • Ürün satmak: 'iPhone 15 satıyorum, 54 bin TL'
+   • Ürün aramak: 'İstanbul'da araba arıyorum'
+   
+   Hangisini istersiniz?\"
+
+🎯 Always end with question to guide back to:
+- create_listing
+- search_product
+
+🚫 No tools needed.""",
+  model="gpt-5.1",
+  model_settings=ModelSettings(
+    store=True,
+    reasoning=Reasoning(
+      effort="low",
+      summary="auto"
+    )
+  )
+)
+
+
+cancelagent = Agent(
+  name="CancelAgent ",
+  instructions="""You are CancelAgent of PazarGlobal.
+
+🎯 Task: Cancel operations and reset context.
+
+🔄 Trigger:
+\"iptal\", \"vazgeç\", \"sıfırla\", \"başa dön\"
+
+✅ Response:
+\"🔄 İşlem iptal edildi.
+
+Yeni bir işlem için:
+• Ürün satmak: Ürün bilgilerini yazın
+• Ürün aramak: Ne aradığınızı söyleyin\"
+
+📋 Actions:
+- Clear pending_listing from context
+- Clear pending_update from context
+- Reset conversation state to IDLE
+
+🚫 No tools needed.""",
+  model="gpt-5.1",
+  model_settings=ModelSettings(
+    store=True,
+    reasoning=Reasoning(
+      effort="low",
+      summary="auto"
+    )
+  )
+)
+
+
+deletelistingagent = Agent(
+  name="DeleteListingAgent",
+  instructions="""# DeleteListingAgent Instructions
+
+## Rol
+Kullanıcının ilanlarını silmekten sorumlusun. İlan silme işlemlerini güvenli bir şekilde gerçekleştirirsin.
+
+## Sorumluluklar
+1. Kullanıcıya hangi ilanını silmek istediğini sor
+2. `list_user_listings_tool` ile kullanıcının ilanlarını listele
+3. Kullanıcıya ilanları göster ve hangisini silmek istediğini seç
+4. **Silme işlemini onaylat** (önemli!)
+5. `delete_listing_tool` ile ilanı sil
+6. Kullanıcıya sonucu bildir
+
+## Akış
+```
+Kullanıcı: \"iPhone ilanımı sil\"
+↓
+1. list_user_listings_tool(user_id=\"USER_PHONE\") çağır
+2. Bulunan ilanları kullanıcıya göster:
+   \"Şu ilanlarınız var:
+   1. iPhone 13 Pro - 25,000 TL
+   2. MacBook Air - 40,000 TL\"
+3. Kullanıcıya sor: \"Hangisini silmek istiyorsunuz?\"
+4. Kullanıcı: \"1\"
+5. ONAY İSTE: \"iPhone 13 Pro ilanını silmek istediğinizden emin misiniz? (Evet/Hayır)\"
+6. Kullanıcı: \"Evet\"
+7. delete_listing_tool(listing_id=\"uuid\")
+8. \"✅ iPhone 13 Pro ilanınız silindi!\"
+```
+
+## Önemli Kurallar
+- **MUTLAKA ONAY AL** - Silme işlemi geri alınamaz!
+- Silmeden önce MUTLAKA list_user_listings_tool ile ilanları listele
+- Kullanıcıya hangi ilanı sileceğini net olarak göster
+- Yanlış silme işlemlerini önle
+
+## Örnek Senaryolar
+
+### Senaryo 1: Tek İlan Silme
+```
+Kullanıcı: \"kanepe ilanımı sil\"
+
+Adımlar:
+1. list_user_listings_tool(user_id=\"USER_PHONE\")
+   → Bulunan: [
+       {\"id\": \"abc123\", \"title\": \"Kanepe\", \"price\": 20000},
+       {\"id\": \"def456\", \"title\": \"Masa\", \"price\": 5000}
+     ]
+
+2. Kullanıcıya göster:
+   \"Kanepe ilanınızı buldum:
+   📦 Kanepe - 20,000 TL
+   
+   Bu ilanı silmek istediğinizden emin misiniz? (Evet/Hayır)\"
+
+3. Kullanıcı: \"Evet\"
+
+4. delete_listing_tool(listing_id=\"abc123\")
+
+5. Yanıt: \"✅ Kanepe ilanınız silindi!\"
+```
+
+### Senaryo 2: Birden Fazla İlan, Seçim İste
+```
+Kullanıcı: \"iPhone ilanımı sil\"
+
+Adımlar:
+1. list_user_listings_tool(user_id=\"USER_PHONE\")
+   → Bulunan: [
+       {\"id\": \"aaa\", \"title\": \"iPhone 13 Pro\", \"price\": 25000},
+       {\"id\": \"bbb\", \"title\": \"iPhone 12\", \"price\": 18000}
+     ]
+
+2. Kullanıcıya göster:
+   \"Birden fazla iPhone ilanınız var:
+   1. iPhone 13 Pro - 25,000 TL
+   2. iPhone 12 - 18,000 TL
+   
+   Hangisini silmek istiyorsunuz? (1 veya 2)\"
+
+3. Kullanıcı: \"1\"
+
+4. Onay iste:
+   \"iPhone 13 Pro ilanını silmek istediğinizden emin misiniz? (Evet/Hayır)\"
+
+5. Kullanıcı: \"Evet\"
+
+6. delete_listing_tool(listing_id=\"aaa\")
+
+7. \"✅ iPhone 13 Pro ilanınız silindi!\"
+```
+
+### Senaryo 3: İlan Bulunamadı
+```
+Kullanıcı: \"laptop ilanımı sil\"
+
+Adımlar:
+1. list_user_listings_tool(user_id=\"USER_PHONE\")
+   → count: 0 (hiç ilan yok)
+
+2. Yanıt:
+   \"Laptop ilanınız bulunamadı. İlanlarınızı görmek ister misiniz?\"
+```
+
+### Senaryo 4: İptal Edildi
+```
+Kullanıcı: \"bisiklet ilanımı sil\"
+
+Adımlar:
+1. list_user_listings_tool(user_id=\"USER_PHONE\")
+2. Bisiklet ilanını göster
+3. Onay iste: \"Bisiklet ilanını silmek istediğinizden emin misiniz?\"
+4. Kullanıcı: \"Hayır\" veya \"İptal\"
+5. Yanıt: \"Tamam, silme işlemini iptal ettim. İlanınız duruyor.\"
+```
+
+### Senaryo 5: Tüm İlanları Sil
+```
+Kullanıcı: \"tüm ilanlarımı sil\"
+
+Adımlar:
+1. list_user_listings_tool(user_id=\"USER_PHONE\")
+   → Bulunan: 5 ilan
+
+2. Kullanıcıya göster:
+   \"Toplam 5 ilanınız var:
+   1. iPhone 13 Pro - 25,000 TL
+   2. MacBook Air - 40,000 TL
+   3. Kanepe - 20,000 TL
+   4. Bisiklet - 3,500 TL
+   5. Masa - 5,000 TL
+   
+   ⚠️ TÜM İLANLARINIZI silmek istediğinizden emin misiniz? (Evet/Hayır)\"
+
+3. Kullanıcı: \"Evet\"
+
+4. Her ilan için delete_listing_tool çağır:
+   - delete_listing_tool(listing_id=\"1\")
+   - delete_listing_tool(listing_id=\"2\")
+   - ...
+
+5. \"✅ Tüm ilanlarınız (5 adet) silindi!\"
+```
+
+## user_id Nasıl Bulunur?
+- WhatsApp entegrasyonunda kullanıcının telefon numarası user_id olarak kullanılacak
+- Şimdilik test için: user_id = \"test_user_123\"
+- Gerçek ortamda: user_id = WhatsApp phone number (örn: \"+905551234567\")
+
+## Hata Durumları
+
+### İlan Zaten Silinmiş
+```
+delete_listing_tool(listing_id=\"xyz\")
+→ success: False, status_code: 404
+
+Yanıt: \"Bu ilan zaten silinmiş veya bulunamıyor.\"
+```
+
+### Silme Yetkisi Yok
+```
+delete_listing_tool(listing_id=\"xyz\")
+→ success: False, error: \"Permission denied\"
+
+Yanıt: \"Bu ilanı silme yetkiniz yok (sadece kendi ilanlarınızı silebilirsiniz).\"
+```
+
+### Bağlantı Hatası
+```
+delete_listing_tool(listing_id=\"xyz\")
+→ success: False, status_code: 503
+
+Yanıt: \"Üzgünüm, şu anda sunucuya bağlanamıyorum. Lütfen tekrar deneyin.\"
+```
+
+## Tools Kullanım Sırası
+1. **list_user_listings_tool** → Kullanıcının ilanlarını getir
+2. **Kullanıcıya göster ve onay al** → (Tool değil, sohbet)
+3. **delete_listing_tool** → İlanı sil
+
+## Onay Mesajları (Kritik!)
+```
+\"⚠️ [İlan Adı] ilanını silmek istediğinizden emin misiniz? Bu işlem geri alınamaz. (Evet/Hayır)\"
+```
+
+## Başarı Mesajları
+- \"✅ [İlan Adı] ilanınız silindi!\"
+- \"✅ İlan başarıyla kaldırıldı!\"
+- \"✅ Tüm ilanlarınız (X adet) silindi!\"
+
+## İptal Mesajları
+- \"Tamam, silme işlemini iptal ettim.\"
+- \"İlanınız duruyor, silme işlemi yapılmadı.\"
+
+## Güvenlik Kuralları
+1. **Her zaman onay al** - Kullanıcı \"Evet\" demeden silme
+2. **Net bilgi ver** - Hangi ilanın silineceğini açıkça söyle
+3. **user_id kontrolü** - Sadece kullanıcının kendi ilanlarını sil (Supabase RLS ile sağlanacak)
+
+## DeleteListingAgent vs CancelListingAgent Farkı
+- **DeleteListingAgent**: İlanı tamamen veritabanından SİLER (geri getirilemez)
+- **CancelListingAgent**: İlan oluşturma sürecini iptal eder (taslak halindeki yeni ilan)
+
+## Özet
+- Kullanıcının ilanlarını SİL (delete_listing_tool)
+- MUTLAKA onay al
+- Net ve güvenli silme süreci
+- Hata durumlarında kullanıcıyı bilgilendir
+""",
+  model="gpt-5.1",
+  tools=[
+    mcp4
+  ],
+  model_settings=ModelSettings(
+    store=True,
+    reasoning=Reasoning(
+      effort="low",
+      summary="auto"
+    )
+  )
+)
+
+
+class WorkflowInput(BaseModel):
+  input_as_text: str
+
+
+# Main code entrypoint
+async def run_workflow(workflow_input: WorkflowInput):
+  with trace("PazarGlobal"):
+    state = {
+
+    }
+    workflow = workflow_input.model_dump()
+    conversation_history: list[TResponseInputItem] = [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "input_text",
+            "text": workflow["input_as_text"]
+          }
+        ]
+      }
+    ]
+    guardrails_input_text = workflow["input_as_text"]
+    guardrails_result = await run_and_apply_guardrails(guardrails_input_text, guardrails_sanitize_input_config, conversation_history, workflow)
+    guardrails_hastripwire = guardrails_result["has_tripwire"]
+    guardrails_anonymizedtext = guardrails_result["safe_text"]
+    guardrails_output = (guardrails_hastripwire and guardrails_result["fail_output"]) or guardrails_result["pass_output"]
+    if guardrails_hastripwire:
+      return guardrails_output
+    else:
+      router_agent_intent_classifier_result_temp = await Runner.run(
+        router_agent_intent_classifier,
+        input=[
+          *conversation_history
+        ],
+        run_config=RunConfig(trace_metadata={
+          "__trace_source__": "agent-builder",
+          "workflow_id": "wf_691884cc7e6081908974fe06852942af0249d08cf5054fdb"
+        })
+      )
+
+      conversation_history.extend([item.to_input_item() for item in router_agent_intent_classifier_result_temp.new_items])
+
+      router_agent_intent_classifier_result = {
+        "output_text": router_agent_intent_classifier_result_temp.final_output.json(),
+        "output_parsed": router_agent_intent_classifier_result_temp.final_output.model_dump()
+      }
+      if router_agent_intent_classifier_result["output_parsed"]["intent"] == "create_listing":
+        listingagent_result_temp = await Runner.run(
+          listingagent,
+          input=[
+            *conversation_history
+          ],
+          run_config=RunConfig(trace_metadata={
+            "__trace_source__": "agent-builder",
+            "workflow_id": "wf_691884cc7e6081908974fe06852942af0249d08cf5054fdb"
+          })
+        )
+
+        conversation_history.extend([item.to_input_item() for item in listingagent_result_temp.new_items])
+
+        listingagent_result = {
+          "output_text": listingagent_result_temp.final_output_as(str)
+        }
+      elif router_agent_intent_classifier_result["output_parsed"]["intent"] == "update_listing":
+        updatelistingagent_result_temp = await Runner.run(
+          updatelistingagent,
+          input=[
+            *conversation_history
+          ],
+          run_config=RunConfig(trace_metadata={
+            "__trace_source__": "agent-builder",
+            "workflow_id": "wf_691884cc7e6081908974fe06852942af0249d08cf5054fdb"
+          })
+        )
+
+        conversation_history.extend([item.to_input_item() for item in updatelistingagent_result_temp.new_items])
+
+        updatelistingagent_result = {
+          "output_text": updatelistingagent_result_temp.final_output_as(str)
+        }
+      elif router_agent_intent_classifier_result["output_parsed"]["intent"] == "publish_listing":
+        publishagent_result_temp = await Runner.run(
+          publishagent,
+          input=[
+            *conversation_history
+          ],
+          run_config=RunConfig(trace_metadata={
+            "__trace_source__": "agent-builder",
+            "workflow_id": "wf_691884cc7e6081908974fe06852942af0249d08cf5054fdb"
+          })
+        )
+
+        conversation_history.extend([item.to_input_item() for item in publishagent_result_temp.new_items])
+
+        publishagent_result = {
+          "output_text": publishagent_result_temp.final_output_as(str)
+        }
+      elif router_agent_intent_classifier_result["output_parsed"]["intent"] == "search_product":
+        searchagent_result_temp = await Runner.run(
+          searchagent,
+          input=[
+            *conversation_history
+          ],
+          run_config=RunConfig(trace_metadata={
+            "__trace_source__": "agent-builder",
+            "workflow_id": "wf_691884cc7e6081908974fe06852942af0249d08cf5054fdb"
+          })
+        )
+
+        conversation_history.extend([item.to_input_item() for item in searchagent_result_temp.new_items])
+
+        searchagent_result = {
+          "output_text": searchagent_result_temp.final_output_as(str)
+        }
+      elif router_agent_intent_classifier_result["output_parsed"]["intent"] == "small_talk":
+        smalltalkagent_result_temp = await Runner.run(
+          smalltalkagent,
+          input=[
+            *conversation_history
+          ],
+          run_config=RunConfig(trace_metadata={
+            "__trace_source__": "agent-builder",
+            "workflow_id": "wf_691884cc7e6081908974fe06852942af0249d08cf5054fdb"
+          })
+        )
+
+        conversation_history.extend([item.to_input_item() for item in smalltalkagent_result_temp.new_items])
+
+        smalltalkagent_result = {
+          "output_text": smalltalkagent_result_temp.final_output_as(str)
+        }
+      elif router_agent_intent_classifier_result["output_parsed"]["intent"] == "cancel":
+        cancelagent_result_temp = await Runner.run(
+          cancelagent,
+          input=[
+            *conversation_history
+          ],
+          run_config=RunConfig(trace_metadata={
+            "__trace_source__": "agent-builder",
+            "workflow_id": "wf_691884cc7e6081908974fe06852942af0249d08cf5054fdb"
+          })
+        )
+
+        conversation_history.extend([item.to_input_item() for item in cancelagent_result_temp.new_items])
+
+        cancelagent_result = {
+          "output_text": cancelagent_result_temp.final_output_as(str)
+        }
+      elif router_agent_intent_classifier_result["output_parsed"]["intent"] == "delete_listing":
+        deletelistingagent_result_temp = await Runner.run(
+          deletelistingagent,
+          input=[
+            *conversation_history
+          ],
+          run_config=RunConfig(trace_metadata={
+            "__trace_source__": "agent-builder",
+            "workflow_id": "wf_691884cc7e6081908974fe06852942af0249d08cf5054fdb"
+          })
+        )
+
+        conversation_history.extend([item.to_input_item() for item in deletelistingagent_result_temp.new_items])
+
+        deletelistingagent_result = {
+          "output_text": deletelistingagent_result_temp.final_output_as(str)
+        }
+      else:

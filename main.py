@@ -1,6 +1,6 @@
 """
 Pazarglobal WhatsApp Bridge
-FastAPI webhook server to bridge WhatsApp (Twilio) with OpenAI Agent Builder
+FastAPI webhook server to bridge WhatsApp (Twilio) with Agent Backend (OpenAI Agents SDK)
 Replaces N8N workflow
 """
 import os
@@ -18,8 +18,7 @@ logger = logging.getLogger(__name__)
 app = FastAPI(title="Pazarglobal WhatsApp Bridge")
 
 # Environment variables
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-OPENAI_WORKFLOW_ID = os.getenv("OPENAI_WORKFLOW_ID", "wf_691884cc7e6081908974fe06852942af0249d08cf5054fdb")
+AGENT_BACKEND_URL = os.getenv("AGENT_BACKEND_URL", "https://pazarglobal-agent-backend-production.up.railway.app")
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 TWILIO_WHATSAPP_NUMBER = os.getenv("TWILIO_WHATSAPP_NUMBER", "+14155238886")
@@ -34,9 +33,10 @@ async def root():
     return {
         "status": "healthy",
         "service": "Pazarglobal WhatsApp Bridge",
-        "version": "1.0.0",
+        "version": "3.0.0",
+        "api_type": "Agent Backend (OpenAI Agents SDK)",
         "twilio_configured": bool(twilio_client),
-        "openai_configured": bool(OPENAI_API_KEY)
+        "agent_backend_url": AGENT_BACKEND_URL
     }
 
 
@@ -52,7 +52,7 @@ async def whatsapp_webhook(
     
     Flow:
     1. Receive WhatsApp message from Twilio
-    2. Send to OpenAI Agent Builder workflow
+    2. Send to Agent Backend (OpenAI Agents SDK with MCP tools)
     3. Get response from agent
     4. Send back via Twilio WhatsApp
     """
@@ -63,12 +63,12 @@ async def whatsapp_webhook(
         phone_number = From.replace('whatsapp:', '')
         user_message = Body
         
-        # Step 1: Call OpenAI Agent Builder
-        logger.info(f"🤖 Calling OpenAI Agent Builder workflow: {OPENAI_WORKFLOW_ID}")
-        agent_response = await call_openai_agent(user_message)
+        # Step 1: Call Agent Backend
+        logger.info(f"🤖 Calling Agent Backend: {AGENT_BACKEND_URL}")
+        agent_response = await call_agent_backend(user_message, phone_number)
         
         if not agent_response:
-            raise HTTPException(status_code=500, detail="No response from OpenAI Agent")
+            raise HTTPException(status_code=500, detail="No response from Agent Backend")
         
         logger.info(f"✅ Agent response: {agent_response[:100]}...")
         
@@ -98,58 +98,70 @@ async def whatsapp_webhook(
         return Response(content=str(resp), media_type="application/xml")
 
 
-async def call_openai_agent(user_input: str) -> str:
+async def call_agent_backend(user_input: str, user_id: str) -> str:
     """
-    Call OpenAI Agent Builder workflow via API
+    Call Agent Backend (OpenAI Agents SDK with MCP tools)
     
     Args:
         user_input: User's message text
+        user_id: User identifier (phone number)
         
     Returns:
         Agent's response text
     """
-    if not OPENAI_API_KEY:
-        logger.error("OPENAI_API_KEY not configured")
+    if not AGENT_BACKEND_URL:
+        logger.error("AGENT_BACKEND_URL not configured")
         return "Sistem yapılandırma hatası. Lütfen yönetici ile iletişime geçin."
     
-    url = "https://api.openai.com/v1/responses"
-    headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "Content-Type": "application/json",
-        "OpenAI-Beta": "agentbuilder=v1"
-    }
-    payload = {
-        "workflow_id": OPENAI_WORKFLOW_ID,
-        "input": {
-            "input_as_text": user_input
-        }
-    }
-    
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            logger.info(f"🔄 POST {url}")
-            response = await client.post(url, headers=headers, json=payload)
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            # Call agent backend endpoint
+            logger.info(f"🚀 Calling Agent Backend: {AGENT_BACKEND_URL}/agent/run")
+            
+            payload = {
+                "user_id": user_id,
+                "message": user_input,
+                "conversation_history": []  # Can be extended to maintain conversation history
+            }
+            
+            response = await client.post(
+                f"{AGENT_BACKEND_URL}/agent/run",
+                json=payload,
+                headers={"Content-Type": "application/json"}
+            )
             response.raise_for_status()
             
-            data = response.json()
-            logger.info(f"📊 OpenAI response status: {response.status_code}")
+            result = response.json()
+            logger.info(f"✅ Agent Backend response received")
+            logger.info(f"   Intent: {result.get('intent', 'unknown')}")
+            logger.info(f"   Success: {result.get('success', False)}")
             
-            # Extract output_text from response
-            output_text = data.get("output_text", "")
-            if not output_text:
-                logger.warning(f"⚠️ No output_text in response: {data}")
-                return "Üzgünüm, yanıt oluşturamadım."
+            if not result.get("success"):
+                logger.error(f"⚠️ Agent Backend returned success=false")
+                return "İşlem başarısız oldu. Lütfen tekrar deneyin."
             
-            return output_text
+            response_text = result.get("response", "")
+            if not response_text:
+                logger.error("⚠️ Empty response from Agent Backend")
+                return "Boş yanıt alındı. Lütfen tekrar deneyin."
+            
+            logger.info(f"✅ Response text: {response_text[:100]}...")
+            return response_text
             
     except httpx.HTTPStatusError as e:
-        logger.error(f"❌ OpenAI API error: {e.response.status_code} - {e.response.text}")
-        return "OpenAI servisi şu anda yanıt vermiyor. Lütfen daha sonra tekrar deneyin."
+        logger.error(f"❌ Agent Backend HTTP error: {e.response.status_code}")
+        try:
+            error_detail = e.response.json()
+            logger.error(f"   Error detail: {error_detail}")
+        except:
+            logger.error(f"   Response text: {e.response.text}")
+        return "Agent servisi şu anda yanıt vermiyor. Lütfen daha sonra tekrar deneyin."
     except httpx.TimeoutException:
-        logger.error("⏱️ OpenAI API timeout")
+        logger.error("⏱️ Agent Backend timeout (120s)")
         return "İstek zaman aşımına uğradı. Lütfen tekrar deneyin."
     except Exception as e:
-        logger.error(f"❌ Unexpected error calling OpenAI: {str(e)}")
+        logger.error(f"❌ Unexpected error calling Agent Backend: {str(e)}")
+        logger.exception(e)
         return "Beklenmeyen bir hata oluştu."
 
 
@@ -159,9 +171,8 @@ async def health_check():
     return {
         "status": "healthy",
         "checks": {
-            "openai_key": "configured" if OPENAI_API_KEY else "missing",
-            "twilio_configured": "yes" if twilio_client else "no",
-            "workflow_id": OPENAI_WORKFLOW_ID
+            "agent_backend_url": AGENT_BACKEND_URL,
+            "twilio_configured": "yes" if twilio_client else "no"
         }
     }
 
