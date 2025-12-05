@@ -287,9 +287,18 @@ async def whatsapp_webhook(
         # Step 3: Send response back via Twilio WhatsApp
         if twilio_client:
             logger.info(f"📤 Sending WhatsApp response to {phone_number}")
+            
+            # Twilio WhatsApp has 1600 character limit - truncate if needed
+            MAX_WHATSAPP_LENGTH = 1600
+            truncated_response = agent_response
+            
+            if len(agent_response) > MAX_WHATSAPP_LENGTH:
+                logger.warning(f"⚠️ Response too long ({len(agent_response)} chars), truncating to {MAX_WHATSAPP_LENGTH}")
+                truncated_response = agent_response[:MAX_WHATSAPP_LENGTH - 50] + "\n\n...(mesaj çok uzun, devamı için daha spesifik arama yapın)"
+            
             message = twilio_client.messages.create(
                 from_=f'whatsapp:{TWILIO_WHATSAPP_NUMBER}',
-                body=agent_response,
+                body=truncated_response,
                 to=f'whatsapp:{phone_number}'
             )
             logger.info(f"✅ Twilio message sent: {message.sid}")
