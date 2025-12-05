@@ -222,6 +222,7 @@ async def whatsapp_webhook(
     5. Send back via Twilio WhatsApp
     """
     logger.info(f"📱 Incoming WhatsApp message from {From}: {Body}")
+    logger.info(f"🔍 DEBUG - NumMedia: {NumMedia}, MediaUrl0: {MediaUrl0}, MediaContentType0: {MediaContentType0}")
 
     # Extract phone number early for history reuse
     phone_number = From.replace('whatsapp:', '')
