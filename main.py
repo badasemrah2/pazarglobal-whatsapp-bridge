@@ -3,6 +3,7 @@ Pazarglobal WhatsApp Bridge
 FastAPI webhook server to bridge WhatsApp (Twilio) with Agent Backend (OpenAI Agents SDK)
 Replaces N8N workflow
 """
+import ast
 import os
 import uuid
 from fastapi import FastAPI, Request, HTTPException, Form
@@ -38,6 +39,36 @@ twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN) if TWILIO_ACCOUNT_
 conversation_store: Dict[str, dict] = {}
 CONVERSATION_TIMEOUT_MINUTES = 30  # Clear conversations after 30 minutes of inactivity
 MAX_MEDIA_BYTES = 10 * 1024 * 1024  # 10 MB limit
+
+
+def _extract_last_media_context(history: List[dict]) -> tuple[Optional[str], List[str]]:
+    """Fetch the latest draft id and media paths from prior system notes."""
+    draft_id = None
+    media_paths: List[str] = []
+
+    for msg in reversed(history or []):
+        text = msg.get("content") if isinstance(msg, dict) else None
+        if not isinstance(text, str):
+            continue
+        if "[SYSTEM_MEDIA_NOTE]" not in text:
+            continue
+
+        if "DRAFT_LISTING_ID=" in text and not draft_id:
+            draft_id = text.split("DRAFT_LISTING_ID=", 1)[1].split("|")[0].strip()
+
+        if "MEDIA_PATHS=" in text and not media_paths:
+            raw_paths = text.split("MEDIA_PATHS=", 1)[1].split("|")[0].strip()
+            try:
+                parsed = ast.literal_eval(raw_paths)
+                if isinstance(parsed, list):
+                    media_paths = [p for p in parsed if isinstance(p, str)]
+            except Exception:
+                media_paths = []
+
+        if draft_id or media_paths:
+            break
+
+    return draft_id, media_paths
 
 
 def _sanitize_user_id(user_id: str) -> str:
@@ -191,30 +222,42 @@ async def whatsapp_webhook(
     5. Send back via Twilio WhatsApp
     """
     logger.info(f"📱 Incoming WhatsApp message from {From}: {Body}")
-    
+
+    # Extract phone number early for history reuse
+    phone_number = From.replace('whatsapp:', '')
+    previous_history = get_conversation_history(phone_number)
+    prev_draft_id, prev_media_paths = _extract_last_media_context(previous_history)
+
     # Check for media attachments
     has_media = NumMedia > 0
     media_url = MediaUrl0 if has_media else None
     media_type = MediaContentType0 if has_media else None
     media_paths: List[str] = []
-    draft_listing_id: Optional[str] = None
-    
+    draft_listing_id: Optional[str] = prev_draft_id
+
     if has_media:
         logger.info(f"📸 Media attached: {media_type} - {media_url}")
-        draft_listing_id = str(uuid.uuid4())
-        uploaded_path = await process_media(From.replace('whatsapp:', ''), draft_listing_id, media_url, media_type)
+        draft_listing_id = draft_listing_id or str(uuid.uuid4())
+        uploaded_path = await process_media(phone_number, draft_listing_id, media_url, media_type)
         if uploaded_path:
-            media_paths.append(uploaded_path)
+            # Merge with previous media (same draft) to keep gallery intact
+            combined_paths = list(dict.fromkeys((prev_media_paths or []) + [uploaded_path]))
+            media_paths.extend(combined_paths)
             logger.info(f"✅ Media uploaded successfully: {uploaded_path}")
+            # Persist system media note so future turns still carry photo paths
+            media_note = f"[SYSTEM_MEDIA_NOTE] DRAFT_LISTING_ID={draft_listing_id} | MEDIA_PATHS={media_paths}"
+            add_to_conversation_history(phone_number, "assistant", media_note)
         else:
             logger.warning("Media processing failed; continuing without attachment")
             # Notify user about media failure (optional: can send a warning message here)
-    
+
+    # If no new media uploaded, still surface previous draft/media context to backend
+    payload_media_paths = media_paths if media_paths else (prev_media_paths if prev_media_paths else None)
+    payload_draft_id = draft_listing_id or prev_draft_id
+
     try:
-        # Extract phone number (remove 'whatsapp:' prefix)
-        phone_number = From.replace('whatsapp:', '')
         user_message = Body
-        
+
         # Get conversation history (previous messages only, NOT current message)
         conversation_history = get_conversation_history(phone_number)
         logger.info(f"📚 Conversation history for {phone_number}: {len(conversation_history)} messages")
@@ -226,9 +269,9 @@ async def whatsapp_webhook(
             user_message, 
             phone_number, 
             conversation_history,
-            media_paths=media_paths if media_paths else None,
-            media_type=media_type if media_paths else None,
-            draft_listing_id=draft_listing_id
+            media_paths=payload_media_paths,
+            media_type=media_type if payload_media_paths else None,
+            draft_listing_id=payload_draft_id
         )
         
         if not agent_response:
