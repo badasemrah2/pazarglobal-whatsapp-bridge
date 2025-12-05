@@ -205,8 +205,10 @@ async def whatsapp_webhook(
         uploaded_path = await process_media(From.replace('whatsapp:', ''), draft_listing_id, media_url, media_type)
         if uploaded_path:
             media_paths.append(uploaded_path)
+            logger.info(f"✅ Media uploaded successfully: {uploaded_path}")
         else:
             logger.warning("Media processing failed; continuing without attachment")
+            # Notify user about media failure (optional: can send a warning message here)
     
     try:
         # Extract phone number (remove 'whatsapp:' prefix)
