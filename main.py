@@ -382,6 +382,10 @@ async def whatsapp_webhook(
     # If no new media uploaded, still surface previous draft/media context to backend
     payload_media_paths = media_paths if media_paths else (prev_media_paths if prev_media_paths else None)
     payload_draft_id = draft_listing_id or prev_draft_id
+    
+    logger.info(f"📦 Sending to agent: draft_id={payload_draft_id}, media_count={len(payload_media_paths) if payload_media_paths else 0}")
+    if payload_media_paths:
+        logger.info(f"📸 Media paths being sent: {payload_media_paths}")
 
     try:
         user_message = Body
