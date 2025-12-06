@@ -92,32 +92,44 @@ async def download_media(media_url: str, media_type: Optional[str], message_sid:
         logger.warning("Twilio credentials missing, cannot fetch media")
         return None
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        logger.info(f"📥 Downloading media from: {media_url[:80]}...")
+        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
             resp = await client.get(media_url, auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN))
+        
+        logger.info(f"📊 Download response: status={resp.status_code}, content-type={resp.headers.get('Content-Type')}")
+        
         if resp.status_code == 404 and twilio_client and message_sid and media_sid:
+            logger.warning(f"⚠️ Direct URL returned 404, trying Twilio API fallback...")
             try:
                 media_obj = twilio_client.messages(message_sid).media(media_sid).fetch()
                 # Twilio returns uri like /2010-04-01/Accounts/AC.../Messages/MM.../Media/ME....json
                 fallback_url = f"https://api.twilio.com{media_obj.uri.replace('.json','')}"
-                async with httpx.AsyncClient(timeout=30.0) as client:
+                logger.info(f"🔄 Fallback URL: {fallback_url}")
+                async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
                     resp = await client.get(fallback_url, auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN))
+                logger.info(f"📊 Fallback response: status={resp.status_code}")
             except Exception as tw_err:
-                logger.warning(f"Twilio fallback media fetch failed: {tw_err}")
+                logger.error(f"❌ Twilio fallback media fetch failed: {tw_err}")
+                return None
 
         if not resp.is_success:
-            logger.warning(f"Failed to download media: status={resp.status_code}")
+            logger.error(f"❌ Failed to download media: status={resp.status_code}, body={resp.text[:200]}")
             return None
+        
         content_type = resp.headers.get("Content-Type", media_type or "")
         if not content_type.startswith("image/"):
-            logger.warning(f"Blocked non-image media: {content_type}")
+            logger.warning(f"⚠️ Blocked non-image media: {content_type}")
             return None
+        
         content = resp.content
         if content and len(content) > MAX_MEDIA_BYTES:
-            logger.warning(f"Media too large ({len(content)} bytes), skipping upload")
+            logger.warning(f"⚠️ Media too large ({len(content)} bytes), skipping upload")
             return None
+        
+        logger.info(f"✅ Media downloaded successfully: {len(content)} bytes, type={content_type}")
         return content, content_type
     except Exception as e:
-        logger.error(f"Error downloading media: {e}")
+        logger.error(f"❌ Error downloading media: {e}", exc_info=True)
         return None
 
 
@@ -202,19 +214,29 @@ async def process_media(
     message_sid: Optional[str] = None,
     media_sid: Optional[str] = None,
 ) -> Optional[str]:
+    logger.info(f"🔄 Processing media: url={media_url[:80]}..., sid={message_sid}, media_sid={media_sid}")
+    
     downloaded = await download_media(media_url, media_type, message_sid, media_sid)
     if not downloaded:
+        logger.error(f"❌ Failed to download media from {media_url[:80]}")
         return None
     content, ctype = downloaded
 
+    logger.info(f"🗜️ Compressing image ({len(content)} bytes)...")
     compressed = _compress_image(content, ctype)
     if compressed:
         content, ctype = compressed
+        logger.info(f"✅ Compressed to {len(content)} bytes")
 
     storage_path = _build_storage_path(user_id, listing_uuid, ctype)
+    logger.info(f"📤 Uploading to Supabase: {storage_path}")
+    
     success = await upload_to_supabase(storage_path, content, ctype)
     if success:
+        logger.info(f"✅ Media uploaded successfully: {storage_path}")
         return storage_path
+    
+    logger.error(f"❌ Failed to upload media to Supabase")
     return None
 
 
@@ -305,6 +327,7 @@ async def whatsapp_webhook(
 
     logger.info(f"📱 Incoming WhatsApp message from {From}: {Body}")
     logger.info(f"🔍 DEBUG - NumMedia: {num_media}, MediaUrl0: {MediaUrl0}, MediaContentType0: {MediaContentType0}")
+    logger.info(f"🔍 DEBUG - MessageSid: {MessageSid}")
     logger.info(f"🧾 FORM MEDIA KEYS: {media_keys}")
     logger.info(f"🧾 FORM ITEMS (first 30): {form_items[:30]}")
 
@@ -334,9 +357,11 @@ async def whatsapp_webhook(
     if has_media:
         logger.info(f"📸 Media attached count: {len(media_items)}")
         draft_listing_id = draft_listing_id or str(uuid.uuid4())
+        logger.info(f"📋 Draft listing ID: {draft_listing_id}")
         uploaded_any = False
 
-        for url, mtype, msid, media_sid in media_items:
+        for idx, (url, mtype, msid, media_sid) in enumerate(media_items):
+            logger.info(f"📸 Processing media {idx+1}/{len(media_items)}: {url[:80]}...")
             uploaded_path = await process_media(phone_number, draft_listing_id, url, mtype, msid, media_sid)
             if uploaded_path:
                 uploaded_any = True
