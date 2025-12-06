@@ -46,9 +46,9 @@ MAX_MEDIA_PER_MESSAGE = 3  # Avoid WhatsApp bulk; keep under total size limits
 
 
 def _extract_last_media_context(history: List[dict]) -> tuple[Optional[str], List[str]]:
-    """Fetch the latest draft id and media paths from prior system notes."""
+    """Fetch the latest draft id and ALL media paths from prior system notes."""
     draft_id = None
-    media_paths: List[str] = []
+    all_media_paths: List[str] = []
 
     for msg in reversed(history or []):
         text = msg.get("content") if isinstance(msg, dict) else None
@@ -57,22 +57,24 @@ def _extract_last_media_context(history: List[dict]) -> tuple[Optional[str], Lis
         if "[SYSTEM_MEDIA_NOTE]" not in text:
             continue
 
+        # Get draft_id from first (most recent) SYSTEM_MEDIA_NOTE
         if "DRAFT_LISTING_ID=" in text and not draft_id:
             draft_id = text.split("DRAFT_LISTING_ID=", 1)[1].split("|")[0].strip()
 
-        if "MEDIA_PATHS=" in text and not media_paths:
+        # Collect ALL media paths from all SYSTEM_MEDIA_NOTE entries
+        if "MEDIA_PATHS=" in text:
             raw_paths = text.split("MEDIA_PATHS=", 1)[1].split("|")[0].strip()
             try:
                 parsed = ast.literal_eval(raw_paths)
                 if isinstance(parsed, list):
-                    media_paths = [p for p in parsed if isinstance(p, str)]
+                    # Add paths that aren't already in the list (avoid duplicates)
+                    for p in parsed:
+                        if isinstance(p, str) and p not in all_media_paths:
+                            all_media_paths.append(p)
             except Exception:
-                media_paths = []
+                pass
 
-        if draft_id or media_paths:
-            break
-
-    return draft_id, media_paths
+    return draft_id, all_media_paths
 
 
 def _sanitize_user_id(user_id: str) -> str:
