@@ -283,9 +283,11 @@ async def whatsapp_webhook(
     """
     form = await request.form()
     num_media = int(form.get("NumMedia", 0) or 0)
+    media_keys = {k: v for k, v in form.items() if k.lower().startswith("media")}
 
     logger.info(f"📱 Incoming WhatsApp message from {From}: {Body}")
     logger.info(f"🔍 DEBUG - NumMedia: {num_media}, MediaUrl0: {MediaUrl0}, MediaContentType0: {MediaContentType0}")
+    logger.info(f"🧾 FORM MEDIA KEYS: {media_keys}")
 
     # Extract phone number early for history reuse
     phone_number = From.replace('whatsapp:', '')
