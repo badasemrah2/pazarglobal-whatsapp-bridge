@@ -280,11 +280,108 @@ def add_to_conversation_history(phone_number: str, role: str, content: str):
     logger.info(f"💾 Conversation history updated for {phone_number}: {len(conversation_store[phone_number]['messages'])} messages")
 
 
+def update_search_cache(phone_number: str, results: List[dict]):
+    """Store last search results (for detail requests) in memory."""
+    if phone_number not in conversation_store:
+        conversation_store[phone_number] = {"messages": [], "last_activity": datetime.now()}
+    conversation_store[phone_number]["search_cache"] = {
+        "results": results,
+        "timestamp": datetime.now().isoformat()
+    }
+    conversation_store[phone_number]["last_activity"] = datetime.now()
+    logger.info(f"💾 Search cache stored for {phone_number}: {len(results)} results")
+
+
+def get_search_cache(phone_number: str) -> Optional[List[dict]]:
+    cache = conversation_store.get(phone_number, {}).get("search_cache")
+    if not cache:
+        return None
+    return cache.get("results") if isinstance(cache.get("results"), list) else None
+
+
+def parse_search_cache_block(text: str) -> tuple[str, Optional[List[dict]]]:
+    """Strip [SEARCH_CACHE]{json} block from text and return remaining text and parsed results."""
+    if not text:
+        return text, None
+    match = re.search(r"\[SEARCH_CACHE\](\{.*\})", text, flags=re.DOTALL)
+    if not match:
+        return text, None
+    json_part = match.group(1)
+    try:
+        parsed = ast.literal_eval(json_part)
+        if isinstance(parsed, dict) and isinstance(parsed.get("results"), list):
+            stripped = text.replace(match.group(0), "").strip()
+            return stripped, parsed.get("results")
+    except Exception:
+        logger.warning("Failed to parse SEARCH_CACHE block")
+    stripped = text.replace(match.group(0), "").strip()
+    return stripped, None
+
+
 def clear_conversation_history(phone_number: str):
     """Clear conversation history for a phone number"""
     if phone_number in conversation_store:
         del conversation_store[phone_number]
         logger.info(f"🗑️ Conversation history cleared for {phone_number}")
+
+
+def format_listing_detail(listing: dict) -> str:
+    """Render a compact detail view for a single listing using cached search results."""
+    title = listing.get("title") or "İlan"
+    price = listing.get("price")
+    location = listing.get("location") or "Belirtilmedi"
+    condition = listing.get("condition") or "Belirtilmedi"
+    category = listing.get("category") or "Belirtilmedi"
+    description = listing.get("description") or ""
+    desc_short = description[:160] + ("..." if len(description or "") > 160 else "")
+
+    lines = [title]
+    if price is not None:
+        lines.append(f"Fiyat: {price} TL")
+    lines.append(f"Konum: {location}")
+    lines.append(f"Durum: {condition}")
+    lines.append(f"Kategori: {category}")
+    if desc_short:
+        lines.append(f"Açıklama: {desc_short}")
+
+    signed_images = listing.get("signed_images") if isinstance(listing.get("signed_images"), list) else []
+    imgs = signed_images[:3]
+    if imgs:
+        lines.append("Fotoğraflar:")
+        lines.extend(imgs)
+    else:
+        lines.append("Fotoğraf yok")
+
+    return "\n".join(lines)
+
+
+def send_twilio_message(phone_number: str, body_text: str) -> None:
+    """Send WhatsApp message via Twilio with length and media safeguards."""
+    if not twilio_client:
+        logger.warning("⚠️ Twilio not configured, response not sent")
+        return
+
+    media_urls = _extract_image_urls(body_text)
+
+    # Twilio WhatsApp limit: body + media_url combined max 1600 chars
+    MAX_WHATSAPP_LENGTH = 1600
+    MEDIA_URL_OVERHEAD = len(media_urls) * 120  # Reserve 120 chars per media URL
+    MAX_BODY_LENGTH = MAX_WHATSAPP_LENGTH - MEDIA_URL_OVERHEAD - 100  # Extra safety margin
+
+    truncated_response = body_text
+    if len(body_text) > MAX_BODY_LENGTH:
+        logger.warning(
+            f"⚠️ Response too long ({len(body_text)} chars), truncating to {MAX_BODY_LENGTH} (with {len(media_urls)} media)"
+        )
+        truncated_response = body_text[:MAX_BODY_LENGTH - 60] + "\n\n...(devamı için daha spesifik arama yapın)"
+
+    message = twilio_client.messages.create(
+        from_=f'whatsapp:{TWILIO_WHATSAPP_NUMBER}',
+        body=truncated_response,
+        media_url=media_urls if media_urls else None,
+        to=f'whatsapp:{phone_number}'
+    )
+    logger.info(f"✅ Twilio message sent: {message.sid}")
 # ================================================
 
 
@@ -390,6 +487,33 @@ async def whatsapp_webhook(
     if payload_media_paths:
         logger.info(f"📸 Media paths being sent: {payload_media_paths}")
 
+    # Short-circuit: detail request using cached search results
+    lower_body = (Body or "").lower().strip()
+    search_cache = get_search_cache(phone_number)
+    detail_match = re.search(r"(\d+)\s*nolu\s*ilan[ıi]?\s*göster", lower_body)
+    detail_idx: Optional[int] = None
+    if detail_match:
+        detail_idx = int(detail_match.group(1)) - 1
+    elif search_cache and len(search_cache) == 1 and ("detay" in lower_body or "ilanı" in lower_body):
+        detail_idx = 0
+
+    if search_cache is not None and detail_idx is not None:
+        if 0 <= detail_idx < len(search_cache):
+            listing = search_cache[detail_idx]
+            detail_text = format_listing_detail(listing)
+            add_to_conversation_history(phone_number, "user", Body)
+            add_to_conversation_history(phone_number, "assistant", detail_text)
+            send_twilio_message(phone_number, detail_text)
+            resp = MessagingResponse()
+            return Response(content=str(resp), media_type="application/xml")
+        else:
+            warn_text = f"Bu aramada sadece {len(search_cache)} ilan var. 1-{len(search_cache)} arasından bir numara seçebilirsin."
+            add_to_conversation_history(phone_number, "user", Body)
+            add_to_conversation_history(phone_number, "assistant", warn_text)
+            send_twilio_message(phone_number, warn_text)
+            resp = MessagingResponse()
+            return Response(content=str(resp), media_type="application/xml")
+
     try:
         user_message = Body
 
@@ -413,39 +537,19 @@ async def whatsapp_webhook(
             raise HTTPException(status_code=500, detail="No response from Agent Backend")
         
         logger.info(f"✅ Agent response: {agent_response[:100]}...")
+
+        # Extract and store search cache (if present), and strip it from user-facing text
+        agent_response, search_cache_results = parse_search_cache_block(agent_response)
+        if search_cache_results:
+            update_search_cache(phone_number, search_cache_results)
+            logger.info(f"📦 Search cache captured with {len(search_cache_results)} results")
         
         # Step 2: Now add both user message and agent response to history
         add_to_conversation_history(phone_number, "user", user_message)
         add_to_conversation_history(phone_number, "assistant", agent_response)
         
         # Step 3: Send response back via Twilio WhatsApp
-        if twilio_client:
-            logger.info(f"📤 Sending WhatsApp response to {phone_number}")
-            
-            # Extract media URLs FIRST to calculate available body length
-            media_urls = _extract_image_urls(agent_response)
-            
-            # Twilio WhatsApp limit: body + media_url combined max 1600 chars
-            # Each media URL ~100 chars, so reserve space
-            MAX_WHATSAPP_LENGTH = 1600
-            MEDIA_URL_OVERHEAD = len(media_urls) * 120  # Reserve 120 chars per media URL
-            MAX_BODY_LENGTH = MAX_WHATSAPP_LENGTH - MEDIA_URL_OVERHEAD - 100  # Extra safety margin
-            
-            truncated_response = agent_response
-            
-            if len(agent_response) > MAX_BODY_LENGTH:
-                logger.warning(f"⚠️ Response too long ({len(agent_response)} chars), truncating to {MAX_BODY_LENGTH} (with {len(media_urls)} media)")
-                truncated_response = agent_response[:MAX_BODY_LENGTH - 60] + "\n\n...(devamı için daha spesifik arama yapın)"
-            
-            message = twilio_client.messages.create(
-                from_=f'whatsapp:{TWILIO_WHATSAPP_NUMBER}',
-                body=truncated_response,
-                media_url=media_urls if media_urls else None,
-                to=f'whatsapp:{phone_number}'
-            )
-            logger.info(f"✅ Twilio message sent: {message.sid}")
-        else:
-            logger.warning("⚠️ Twilio not configured, response not sent")
+        send_twilio_message(phone_number, agent_response)
         
         # Return TwiML response (Twilio expects this)
         resp = MessagingResponse()
