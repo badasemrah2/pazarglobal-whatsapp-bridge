@@ -610,6 +610,7 @@ async def call_agent_backend(
             
             payload = {
                 "user_id": user_id,
+                "phone": user_id,  # Phone number for user profile lookup
                 "message": user_input,
                 "conversation_history": conversation_history,  # Now includes full conversation context!
                 "media_paths": media_paths,
