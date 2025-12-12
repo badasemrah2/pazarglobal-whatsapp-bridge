@@ -462,13 +462,13 @@ async def whatsapp_webhook(
         logger.info(f"🧾 MEDIA ITEMS PARSED: {media_items}")
 
     first_media_type = media_items[0][1] if has_media else None
-    # Start with previous media paths (from earlier webhooks/messages)
-    media_paths: List[str] = list(prev_media_paths) if prev_media_paths else []
-    draft_listing_id: Optional[str] = prev_draft_id
+    # Fresh media list for each new media message (vision needs only current photo)
+    media_paths: List[str] = []
+    draft_listing_id: Optional[str] = None
 
     if has_media:
         logger.info(f"📸 Media attached count: {len(media_items)}")
-        draft_listing_id = draft_listing_id or str(uuid.uuid4())
+        draft_listing_id = str(uuid.uuid4())  # Always create new draft for vision analysis
         logger.info(f"📋 Draft listing ID: {draft_listing_id}")
         uploaded_any = False
 
@@ -477,9 +477,7 @@ async def whatsapp_webhook(
             uploaded_path = await process_media(phone_number, draft_listing_id, url, mtype, msid, media_sid)
             if uploaded_path:
                 uploaded_any = True
-                # Add to media_paths if not already there
-                if uploaded_path not in media_paths:
-                    media_paths.append(uploaded_path)
+                media_paths.append(uploaded_path)
                 logger.info(f"✅ Media uploaded: {uploaded_path}")
             else:
                 logger.warning(f"Media upload failed for {url}")
