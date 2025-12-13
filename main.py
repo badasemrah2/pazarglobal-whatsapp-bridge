@@ -26,6 +26,10 @@ app = FastAPI(title="Pazarglobal WhatsApp Bridge")
 
 # Environment variables
 AGENT_BACKEND_URL = os.getenv("AGENT_BACKEND_URL", "https://pazarglobal-agent-backend-production-4ec8.up.railway.app")
+
+# Edge Function URL (Traffic Controller)
+EDGE_FUNCTION_URL = os.getenv("EDGE_FUNCTION_URL", "https://YOUR_PROJECT.supabase.co/functions/v1/whatsapp-traffic-controller")
+
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 TWILIO_WHATSAPP_NUMBER = os.getenv("TWILIO_WHATSAPP_NUMBER", "+14155238886")
@@ -584,7 +588,12 @@ async def call_agent_backend(
     draft_listing_id: Optional[str] = None
 ) -> str:
     """
-    Call Agent Backend (OpenAI Agents SDK with MCP tools)
+    Call Edge Function (Traffic Controller) → Backend
+    
+    Edge Function handles:
+    - PIN verification (10-minute sessions)
+    - Session timeout management
+    - Rate limiting & security
     
     Args:
         user_input: User's message text
@@ -595,48 +604,62 @@ async def call_agent_backend(
         draft_listing_id: Optional UUID to keep storage paths and DB id aligned
         
     Returns:
-        Agent's response text
+        Agent's response text or PIN request message
     """
-    if not AGENT_BACKEND_URL:
-        logger.error("AGENT_BACKEND_URL not configured")
+    if not EDGE_FUNCTION_URL:
+        logger.error("EDGE_FUNCTION_URL not configured")
         return "Sistem yapılandırma hatası. Lütfen yönetici ile iletişime geçin."
     
     try:
         async with httpx.AsyncClient(timeout=120.0) as client:
-            # Call agent backend endpoint
-            logger.info(f"🚀 Calling Agent Backend: {AGENT_BACKEND_URL}/agent/run")
+            # Call Edge Function (Traffic Police)
+            logger.info(f"🚦 Calling Edge Function: {EDGE_FUNCTION_URL}")
             
             payload = {
-                "user_id": user_id,
-                "phone": user_id,  # Phone number for user profile lookup
+                "source": "whatsapp",  # Important: identifies traffic source
+                "phone": user_id,
                 "message": user_input,
-                "conversation_history": conversation_history,  # Now includes full conversation context!
+                "conversation_history": conversation_history,
                 "media_paths": media_paths,
                 "media_type": media_type,
                 "draft_listing_id": draft_listing_id,
             }
             
-            logger.info(f"📦 Payload: user_id={user_id}, history_length={len(conversation_history)}")
+            logger.info(f"📦 Payload: phone={user_id}, message_length={len(user_input)}, history_length={len(conversation_history)}")
             
             response = await client.post(
-                f"{AGENT_BACKEND_URL}/agent/run",
+                EDGE_FUNCTION_URL,
                 json=payload,
-                headers={"Content-Type": "application/json"}
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}"  # Edge Function auth
+                }
             )
-            response.raise_for_status()
             
             result = response.json()
-            logger.info(f"✅ Agent Backend response received")
-            logger.info(f"   Intent: {result.get('intent', 'unknown')}")
-            logger.info(f"   Success: {result.get('success', False)}")
+            logger.info(f"📨 Edge Function response: status={response.status_code}")
+            
+            # Check if PIN required
+            if result.get("require_pin"):
+                logger.info("🔒 PIN required - session expired or not exists")
+                return result.get("response", "🔒 Güvenlik için PIN kodunuzu girin")
+            
+            # Check for errors
+            if response.status_code == 403:
+                logger.warning("⛔ Access denied - PIN required")
+                return result.get("response", "⛔ Erişim reddedildi. PIN kodunuzu girin.")
+            
+            if response.status_code == 401:
+                logger.warning("❌ Invalid PIN")
+                return result.get("response", "❌ Hatalı PIN kodu")
             
             if not result.get("success"):
-                logger.error(f"⚠️ Agent Backend returned success=false")
-                return "İşlem başarısız oldu. Lütfen tekrar deneyin."
+                logger.error(f"⚠️ Edge Function returned success=false")
+                return result.get("response", "İşlem başarısız oldu. Lütfen tekrar deneyin.")
             
             response_text = result.get("response", "")
             if not response_text:
-                logger.error("⚠️ Empty response from Agent Backend")
+                logger.error("⚠️ Empty response from Edge Function")
                 return "Boş yanıt alındı. Lütfen tekrar deneyin."
             
             logger.info(f"✅ Response text: {response_text[:100]}...")
