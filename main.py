@@ -28,6 +28,7 @@ app = FastAPI(title="Pazarglobal WhatsApp Bridge")
 AGENT_BACKEND_URL = os.getenv("AGENT_BACKEND_URL", "https://pazarglobal-agent-backend-production-4ec8.up.railway.app")
 
 # Edge Function URL (Traffic Controller)
+# IMPORTANT: Must point to your Supabase project, otherwise WhatsApp traffic bypasses the security gate.
 EDGE_FUNCTION_URL = os.getenv("EDGE_FUNCTION_URL", "https://YOUR_PROJECT.supabase.co/functions/v1/whatsapp-traffic-controller")
 
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
@@ -601,9 +602,9 @@ async def whatsapp_webhook(
                     "timestamp": datetime.now().isoformat(),
                 })
         
-        # Step 1: Call Agent Backend with conversation history + media URL
+        # Step 1: Call Edge Traffic Controller (PIN + 10min session gate) with conversation history + media
         # NOTE: current user_message is sent separately, NOT in history
-        logger.info(f"🤖 Calling Agent Backend: {AGENT_BACKEND_URL}")
+        logger.info("🚦 Calling Edge Traffic Controller")
         agent_response = await call_agent_backend(
             user_message, 
             phone_number, 
@@ -672,9 +673,9 @@ async def call_agent_backend(
     Returns:
         Agent's response text or PIN request message
     """
-    if not EDGE_FUNCTION_URL:
+    if not EDGE_FUNCTION_URL or "YOUR_PROJECT.supabase.co" in EDGE_FUNCTION_URL or "YOUR_PROJECT" in EDGE_FUNCTION_URL:
         logger.error("EDGE_FUNCTION_URL not configured")
-        return "Sistem yapılandırma hatası. Lütfen yönetici ile iletişime geçin."
+        return "Sistem yapılandırma hatası: WhatsApp güvenlik kapısı (EDGE_FUNCTION_URL) tanımlı değil."
     
     try:
         async with httpx.AsyncClient(timeout=120.0) as client:
@@ -698,7 +699,9 @@ async def call_agent_backend(
                 json=payload,
                 headers={
                     "Content-Type": "application/json",
-                    "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}"  # Edge Function auth
+                    # Supabase Edge Functions: service role key for server-to-server calls
+                    "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+                    "apikey": SUPABASE_SERVICE_KEY,
                 }
             )
             
