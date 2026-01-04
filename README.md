@@ -1,19 +1,21 @@
 # 📱 PazarGlobal WhatsApp Bridge
 
-**Twilio WhatsApp API ↔️ Agent Backend Bridge Service**
+## Twilio WhatsApp API ↔️ Agent Backend Bridge Service
 
-WhatsApp kullanıcılarını PazarGlobal AI Agent Backend'e bağlayan webhook servisi. Twilio WhatsApp Business API entegrasyonu ile kullanıcıların WhatsApp üzerinden ilan oluşturma, arama ve yönetme işlemlerini gerçekleştirmesini sağlar.
+WhatsApp kullanıcılarını PazarGlobal AI Agent Backend'e bağlayan webhook servisi.
+Twilio WhatsApp Business API entegrasyonu ile kullanıcıların WhatsApp üzerinden
+ilan oluşturma, arama ve yönetme işlemlerini gerçekleştirmesini sağlar.
 
 ---
 
 ## 📋 İçindekiler
 
-- [Mimari Genel Bakış](#-mimari-genel-bakış)
+- [Mimari Genel Bakış](#mimari-genel-bakış)
 - [Özellikler](#-özellikler)
 - [Kurulum](#-kurulum)
 - [Railway Deployment](#-railway-deployment)
 - [Twilio Konfigürasyonu](#-twilio-konfigürasyonu)
-- [Media Handling](#-media-handling)
+- [Media Handling](#media-handling)
 - [Conversation Management](#-conversation-management)
 - [Environment Variables](#-environment-variables)
 - [API Endpoints](#-api-endpoints)
@@ -21,9 +23,9 @@ WhatsApp kullanıcılarını PazarGlobal AI Agent Backend'e bağlayan webhook se
 
 ---
 
-## 🏗️ Mimari Genel Bakış
+## Mimari Genel Bakış
 
-```
+```text
 ┌──────────────────────────────────────────────────────────────┐
 │              PazarGlobal WhatsApp Bridge                     │
 │          (Twilio ↔️ Agent Backend Köprüsü)                   │
@@ -49,7 +51,10 @@ WhatsApp kullanıcılarını PazarGlobal AI Agent Backend'e bağlayan webhook se
 │  │  3. Upload to Supabase Storage  │                        │
 │  └─────────────────────────────────┘                        │
 │       ↓                                                      │
-│  POST Agent Backend /agent/run                              │
+│  POST Supabase Edge /functions/v1/whatsapp-traffic-controller│
+│   (PIN + 10dk session gate)                                  │
+│       ↓                                                      │
+│  Edge forwards → Agent API /agent/run                        │
 │       ↓                                                      │
 │  Agent Response                                              │
 │       ↓                                                      │
@@ -112,7 +117,7 @@ conversation_store = {
 
 **Media Processing Pipeline:**
 
-```
+```text
 Twilio Media URL → Download (with auth)
                       ↓
                  Validate (image/*, max 10MB)
@@ -128,7 +133,8 @@ Twilio Media URL → Download (with auth)
 
 ### 4. **Agent Backend Integration**
 
-- ✅ POST to `/agent/run` endpoint
+- ✅ POST to Supabase Edge `whatsapp-traffic-controller` endpoint
+- ✅ Edge üzerinden Agent API `/agent/run`'a forward
 - ✅ User ID mapping (phone → Supabase users)
 - ✅ Media paths forwarding
 - ✅ Conversation history sync
@@ -160,7 +166,7 @@ pip install -r requirements.txt
 
 **requirements.txt:**
 
-```
+```text
 fastapi
 uvicorn[standard]
 python-multipart
@@ -194,6 +200,9 @@ SUPABASE_STORAGE_BUCKET=product-images
 # Server
 PORT=8080
 ```
+
+Not: Güncel akışta Bridge’in kritik çağrısı `EDGE_FUNCTION_URL`’edir.
+Backend’e erişim Edge tarafından `BACKEND_URL` üzerinden yapılır.
 
 ### 4. Lokal Çalıştırma
 
@@ -287,7 +296,7 @@ Expected:
 
 - **When a message comes in:**
 
-  ```
+    ```text
   https://your-railway-url.up.railway.app/webhook/whatsapp
   ```
 
@@ -312,7 +321,7 @@ Expected:
 
 ---
 
-## 🖼️ Media Handling
+## Media Handling
 
 ### Media Download & Validation
 
@@ -358,7 +367,7 @@ def _compress_image(content: bytes, media_type: str) -> bytes:
 
 **Storage Path Format:**
 
-```
+```text
 {user_id}/{listing_uuid}/{random_uuid}.{ext}
 
 Example:
@@ -382,8 +391,10 @@ return path  # Agent backend will handle signed URLs
 
 **[SYSTEM_MEDIA_NOTE] Format:**
 
-```
-[SYSTEM_MEDIA_NOTE] DRAFT_LISTING_ID=550e8400-... | MEDIA_PATHS=['path1.jpg', 'path2.jpg'] | MEDIA_TYPE=image/jpeg
+```text
+[SYSTEM_MEDIA_NOTE] DRAFT_LISTING_ID=550e8400-...
+| MEDIA_PATHS=['path1.jpg', 'path2.jpg']
+| MEDIA_TYPE=image/jpeg
 ```
 
 **Purpose:**
@@ -394,12 +405,13 @@ return path  # Agent backend will handle signed URLs
 
 **Example Flow:**
 
-```
+```text
 User: [Sends photo 1]
 Bridge: [SYSTEM_MEDIA_NOTE] DRAFT_ID=abc | MEDIA_PATHS=['photo1.jpg']
 
 User: "Bir fotoğraf daha gönderiyorum" [Sends photo 2]
-Bridge: [Extracts draft_id=abc] → [SYSTEM_MEDIA_NOTE] DRAFT_ID=abc | MEDIA_PATHS=['photo1.jpg', 'photo2.jpg']
+Bridge: [Extracts draft_id=abc]
+→ [SYSTEM_MEDIA_NOTE] DRAFT_ID=abc | MEDIA_PATHS=['photo1.jpg', 'photo2.jpg']
 
 User: "Yayınla"
 Agent: insert_listing_tool(images=['photo1.jpg', 'photo2.jpg'])
@@ -470,7 +482,7 @@ if len(history) > MAX_HISTORY_LENGTH:
 ## 🔧 Environment Variables
 
 | Variable | Gerekli | Açıklama | Örnek |
-|----------|---------|----------|-------|
+| -------- | ------- | -------- | ----- |
 | `AGENT_BACKEND_URL` | ✅ | Agent Backend URL | `https://...railway.app` |
 | `TWILIO_ACCOUNT_SID` | ✅ | Twilio Account SID | `AC123...` |
 | `TWILIO_AUTH_TOKEN` | ✅ | Twilio Auth Token | `abc123...` |
@@ -525,7 +537,7 @@ Twilio WhatsApp webhook endpoint.
 
 **Expected Form Data (from Twilio):**
 
-```
+```text
 Body: "Message text"
 From: "whatsapp:+905551234567"
 To: "whatsapp:+14155238886"
@@ -600,7 +612,7 @@ echo $SUPABASE_SERVICE_KEY
 
 **Logs:**
 
-```
+```text
 📥 Downloading media from: https://api.twilio.com/...
 📊 Download response: status=200, content-type=image/jpeg
 ✅ Media downloaded successfully: 245678 bytes
@@ -710,7 +722,7 @@ def save_conversation(phone: str, messages: list):
 
 **Flow:**
 
-```
+```text
 WhatsApp Voice → Twilio → Bridge download
                               ↓
                     OpenAI Whisper API
@@ -809,7 +821,7 @@ user_context["language"] = language
 
 ### Code Structure
 
-```
+```text
 pazarglobal-whatsapp-bridge/
 ├── main.py                      # FastAPI app + webhook handler
 ├── requirements.txt             # Dependencies
