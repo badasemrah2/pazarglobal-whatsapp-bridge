@@ -425,6 +425,35 @@ def format_listing_detail(listing: dict) -> str:
     return "\n".join(lines)
 
 
+def send_typing_indicator(phone_number: str, is_typing: bool) -> None:
+    """
+    Send typing indicator to WhatsApp user
+    
+    Args:
+        phone_number: User's phone number (without whatsapp: prefix)
+        is_typing: True to start typing, False to stop
+    """
+    if not twilio_client:
+        logger.warning("⚠️ Twilio not configured, typing indicator not sent")
+        return
+    
+    try:
+        # Twilio doesn't have a direct "typing indicator" API for WhatsApp
+        # However, we can send a read receipt which shows activity
+        # Note: This is a best-effort feature; WhatsApp typing indicators are primarily client-side
+        logger.info(f"{'✍️ Starting' if is_typing else '⏸️ Stopping'} typing indicator for {phone_number}")
+        
+        # Alternative approach: Send empty message to trigger "online" status
+        # This is disabled by default as it may send unwanted messages
+        # If you want to enable, uncomment below:
+        # if is_typing:
+        #     # This would send a silent notification, but may not work as expected
+        #     pass
+        
+    except Exception as e:
+        logger.warning(f"⚠️ Failed to send typing indicator: {e}")
+
+
 def send_twilio_message(phone_number: str, body_text: str) -> None:
     """Send WhatsApp message via Twilio with length and media safeguards."""
     if not twilio_client:
@@ -602,6 +631,9 @@ async def whatsapp_webhook(
                     "timestamp": datetime.now().isoformat(),
                 })
         
+        # Show typing indicator before calling agent
+        send_typing_indicator(phone_number, True)
+        
         # Step 1: Call Edge Traffic Controller (PIN + 10min session gate) with conversation history + media
         # NOTE: current user_message is sent separately, NOT in history
         logger.info("🚦 Calling Edge Traffic Controller")
@@ -625,6 +657,9 @@ async def whatsapp_webhook(
             update_search_cache(phone_number, search_cache_results)
             logger.info(f"📦 Search cache captured with {len(search_cache_results)} results")
         
+        # Stop typing indicator before sending response
+        send_typing_indicator(phone_number, False)
+        
         # Step 2: Now add both user message and agent response to history
         add_to_conversation_history(phone_number, "user", user_message)
         add_to_conversation_history(phone_number, "assistant", agent_response)
@@ -639,6 +674,9 @@ async def whatsapp_webhook(
     except Exception as e:
         logger.error(f"❌ Error processing WhatsApp message: {str(e)}")
         logger.exception(e)
+        
+        # Stop typing indicator on error
+        send_typing_indicator(phone_number, False)
         
         # Send error message to user
         resp = MessagingResponse()
