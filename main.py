@@ -17,6 +17,7 @@ import logging
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 from PIL import Image
+from redis_helper import redis_client  # Redis client for persistent storage
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -43,7 +44,8 @@ SUPABASE_STORAGE_BUCKET = os.getenv("SUPABASE_STORAGE_BUCKET", "product-images")
 twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN) if TWILIO_ACCOUNT_SID else None
 
 # ========== CONVERSATION HISTORY CACHE ==========
-# In-memory storage: {phone_number: {"messages": [...], "last_activity": datetime}}
+# Now using Redis for persistent storage with in-memory fallback
+# In-memory storage (legacy fallback when Redis unavailable):
 conversation_store: Dict[str, dict] = {}
 CONVERSATION_TIMEOUT_MINUTES = 30  # Clear conversations after 30 minutes of inactivity
 MAX_MEDIA_BYTES = 10 * 1024 * 1024  # 10 MB limit
@@ -278,13 +280,21 @@ async def process_media(
 
 
 def get_conversation_history(phone_number: str) -> List[dict]:
-    """Get conversation history for a phone number"""
+    """Get conversation history for a phone number (Redis-first with fallback)"""
+    # Try Redis first
+    redis_key = f"conv:{phone_number}"
+    redis_data = redis_client.get_json(redis_key)
+    
+    if redis_data and isinstance(redis_data, dict):
+        messages = redis_data.get("messages", [])
+        logger.info(f"📚 Retrieved {len(messages)} messages from Redis for {phone_number}")
+        return messages
+    
+    # Fallback to in-memory
     if phone_number not in conversation_store:
         return []
     
     session = conversation_store[phone_number]
-    
-    # Check if conversation expired
     if datetime.now() - session["last_activity"] > timedelta(minutes=CONVERSATION_TIMEOUT_MINUTES):
         logger.info(f"🕐 Conversation expired for {phone_number}, clearing history")
         del conversation_store[phone_number]
@@ -294,12 +304,32 @@ def get_conversation_history(phone_number: str) -> List[dict]:
 
 
 def add_to_conversation_history(phone_number: str, role: str, content: str):
-    """Add a message to conversation history"""
+    """Add a message to conversation history (Redis-first with fallback)"""
+    redis_key = f"conv:{phone_number}"
+    
+    # Get existing conversation from Redis
+    redis_data = redis_client.get_json(redis_key)
+    if not redis_data:
+        redis_data = {"messages": [], "last_activity": datetime.now().isoformat()}
+    
+    # Add new message
+    redis_data["messages"].append({
+        "role": role,
+        "content": content,
+        "timestamp": datetime.now().isoformat()
+    })
+    redis_data["last_activity"] = datetime.now().isoformat()
+    
+    # Keep only last 20 messages
+    if len(redis_data["messages"]) > 20:
+        redis_data["messages"] = redis_data["messages"][-20:]
+    
+    # Save to Redis (30 min TTL)
+    redis_client.set_json(redis_key, redis_data, ttl=1800)
+    
+    # Also update in-memory for fallback
     if phone_number not in conversation_store:
-        conversation_store[phone_number] = {
-            "messages": [],
-            "last_activity": datetime.now()
-        }
+        conversation_store[phone_number] = {"messages": [], "last_activity": datetime.now()}
     
     conversation_store[phone_number]["messages"].append({
         "role": role,
@@ -308,11 +338,10 @@ def add_to_conversation_history(phone_number: str, role: str, content: str):
     })
     conversation_store[phone_number]["last_activity"] = datetime.now()
     
-    # Keep only last 20 messages to prevent memory overflow
     if len(conversation_store[phone_number]["messages"]) > 20:
         conversation_store[phone_number]["messages"] = conversation_store[phone_number]["messages"][-20:]
     
-    logger.info(f"💾 Conversation history updated for {phone_number}: {len(conversation_store[phone_number]['messages'])} messages")
+    logger.info(f"💾 Conversation updated (Redis + memory) for {phone_number}: {len(redis_data['messages'])} messages")
 
 
 def update_search_cache(phone_number: str, results: List[dict]):

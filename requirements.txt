@@ -4,3 +4,4 @@ httpx==0.26.0
 twilio==8.11.1
 python-multipart==0.0.6
 pillow==10.3.0
+redis==5.0.1
