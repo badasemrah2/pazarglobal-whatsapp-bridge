@@ -897,6 +897,7 @@ async def call_agent_backend(
             }
             
             logger.info(f"📦 Payload: phone={user_id}, message_length={len(user_input)}, history_length={len(conversation_history)}")
+            logger.info(f"🔍 DEBUG USER_ID FLOW: WhatsApp Bridge sending phone={user_id} to Edge Function")
             
             response = await client.post(
                 EDGE_FUNCTION_URL,
@@ -911,6 +912,7 @@ async def call_agent_backend(
             
             result = response.json()
             logger.info(f"📨 Edge Function response: status={response.status_code}")
+            logger.info(f"🔍 DEBUG USER_ID FLOW: Edge response contains user_id={result.get('user_id', 'NOT_PRESENT')}")
             
             # Check if PIN required
             if result.get("require_pin"):
