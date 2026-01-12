@@ -274,46 +274,64 @@ JSON formatında cevap ver:
         # We'll send it directly to OpenAI since we have access to OPENAI_API_KEY
         openai_key = os.getenv("OPENAI_API_KEY")
         if not openai_key:
-            logger.warning("⚠️ OPENAI_API_KEY not set, cannot analyze image")
+            logger.error("❌ OPENAI_API_KEY environment variable not set - cannot analyze images. Check Railway Variables.")
+            return None
+        
+        if not openai_key.startswith("sk-"):
+            logger.error(f"❌ OPENAI_API_KEY format invalid (expected sk-***, got {openai_key[:10]}...)")
             return None
         
         async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.post(
-                "https://api.openai.com/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {openai_key}",
-                    "Content-Type": "application/json"
-                },
-                json={
-                    "model": "gpt-4o-mini",
-                    "messages": [
-                        {"role": "system", "content": system_prompt},
-                        {
-                            "role": "user",
-                            "content": [
-                                {"type": "text", "text": user_prompt},
-                                {"type": "image_url", "image_url": {"url": image_url}}
-                            ]
-                        }
-                    ],
-                    "max_tokens": 600,
-                    "response_format": {"type": "json_object"}
-                }
-            )
+            try:
+                response = await client.post(
+                    "https://api.openai.com/v1/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {openai_key}",
+                        "Content-Type": "application/json"
+                    },
+                    json={
+                        "model": "gpt-4o-mini",
+                        "messages": [
+                            {"role": "system", "content": system_prompt},
+                            {
+                                "role": "user",
+                                "content": [
+                                    {"type": "text", "text": user_prompt},
+                                    {"type": "image_url", "image_url": {"url": image_url}}
+                                ]
+                            }
+                        ],
+                        "max_tokens": 600,
+                        "response_format": {"type": "json_object"}
+                    }
+                )
+            except httpx.TimeoutException as te:
+                logger.error(f"❌ Vision API timeout after 30s: {te}")
+                return None
+            except Exception as req_err:
+                logger.error(f"❌ Vision API request failed: {req_err}")
+                return None
         
         if not response.is_success:
-            logger.error(f"❌ Vision API failed: {response.status_code} - {response.text[:200]}")
+            logger.error(f"❌ Vision API failed: status={response.status_code}")
+            logger.error(f"Response text: {response.text[:500]}")
             return None
         
-        result = response.json()
+        try:
+            result = response.json()
+        except Exception as parse_err:
+            logger.error(f"❌ Failed to parse Vision API response: {parse_err}")
+            return None
+        
         content = result.get("choices", [{}])[0].get("message", {}).get("content", "{}")
         
         try:
             analysis = json.loads(content)
             logger.info(f"✅ Vision analysis complete: {analysis.get('product', 'N/A')}")
             return analysis
-        except json.JSONDecodeError:
-            logger.warning(f"⚠️ Vision API returned invalid JSON: {content[:200]}")
+        except json.JSONDecodeError as jde:
+            logger.warning(f"⚠️ Vision API returned invalid JSON: {jde}")
+            logger.warning(f"Content: {content[:200]}")
             return {"summary": content}
             
     except Exception as e:
