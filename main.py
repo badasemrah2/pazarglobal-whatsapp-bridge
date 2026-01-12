@@ -5,6 +5,7 @@ Replaces N8N workflow
 """
 import ast
 import io
+import json
 import os
 import uuid
 import re
@@ -245,6 +246,81 @@ async def upload_to_supabase(path: str, content: bytes, content_type: str) -> bo
         return False
 
 
+async def analyze_image_with_vision(image_url: str) -> Optional[dict]:
+    """Call OpenAI Vision API to analyze product image (same as webchat does)."""
+    try:
+        logger.info(f"🔍 Analyzing image with Vision API: {image_url[:80]}...")
+        
+        # Vision analysis prompts (matching webchat behavior)
+        system_prompt = """Sen bir e-ticaret platformu için ürün görsellerini analiz eden bir asistansın.
+        
+Görevin:
+1. Görseldeki ürünü tanımla (kategori/isim)
+2. Ürünün durumunu değerlendir (yeni/kullanılmış/hasarlı)
+3. Öne çıkan özellikleri listele
+4. İçerik güvenliğini kontrol et (uygunsuz içerik varsa uyar)
+
+JSON formatında cevap ver:
+{
+  "product": "ürün adı/kategorisi",
+  "condition": "çok iyi görünüyor / kullanılmış / hasarlı",
+  "features": ["özellik 1", "özellik 2", "özellik 3"],
+  "safety_flags": []
+}"""
+
+        user_prompt = "Bu görseldeki ürünü analiz et ve yukarıdaki formatta JSON ile cevapla."
+        
+        # Make API call to Agent Backend's vision endpoint
+        # We'll send it directly to OpenAI since we have access to OPENAI_API_KEY
+        openai_key = os.getenv("OPENAI_API_KEY")
+        if not openai_key:
+            logger.warning("⚠️ OPENAI_API_KEY not set, cannot analyze image")
+            return None
+        
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {openai_key}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "model": "gpt-4o-mini",
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": user_prompt},
+                                {"type": "image_url", "image_url": {"url": image_url}}
+                            ]
+                        }
+                    ],
+                    "max_tokens": 600,
+                    "response_format": {"type": "json_object"}
+                }
+            )
+        
+        if not response.is_success:
+            logger.error(f"❌ Vision API failed: {response.status_code} - {response.text[:200]}")
+            return None
+        
+        result = response.json()
+        content = result.get("choices", [{}])[0].get("message", {}).get("content", "{}")
+        
+        try:
+            analysis = json.loads(content)
+            logger.info(f"✅ Vision analysis complete: {analysis.get('product', 'N/A')}")
+            return analysis
+        except json.JSONDecodeError:
+            logger.warning(f"⚠️ Vision API returned invalid JSON: {content[:200]}")
+            return {"summary": content}
+            
+    except Exception as e:
+        logger.error(f"❌ Vision analysis error: {e}")
+        return None
+
+
 async def process_media(
     user_id: str,
     listing_uuid: str,
@@ -252,7 +328,12 @@ async def process_media(
     media_type: Optional[str],
     message_sid: Optional[str] = None,
     media_sid: Optional[str] = None,
-) -> Optional[str]:
+) -> Optional[dict]:
+    """Process media: download, compress, upload to Supabase, and analyze with Vision API.
+    
+    Returns:
+        dict with 'path' and 'analysis', or None if processing failed
+    """
     logger.info(f"🔄 Processing media: url={media_url[:80]}..., sid={message_sid}, media_sid={media_sid}")
     
     downloaded = await download_media(media_url, media_type, message_sid, media_sid)
@@ -271,12 +352,20 @@ async def process_media(
     logger.info(f"📤 Uploading to Supabase: {storage_path}")
     
     success = await upload_to_supabase(storage_path, content, ctype)
-    if success:
-        logger.info(f"✅ Media uploaded successfully: {storage_path}")
-        return storage_path
+    if not success:
+        logger.error(f"❌ Failed to upload media to Supabase")
+        return None
     
-    logger.error(f"❌ Failed to upload media to Supabase")
-    return None
+    logger.info(f"✅ Media uploaded successfully: {storage_path}")
+    
+    # Now analyze the uploaded image with Vision API
+    full_image_url = f"{SUPABASE_URL}/storage/v1/object/public/{SUPABASE_STORAGE_BUCKET}/{storage_path}"
+    analysis = await analyze_image_with_vision(full_image_url)
+    
+    return {
+        "path": storage_path,
+        "analysis": analysis
+    }
 
 
 def get_conversation_history(phone_number: str) -> List[dict]:
@@ -587,6 +676,7 @@ async def whatsapp_webhook(
     first_media_type = media_items[0][1] if has_media else None
     # Fresh media list for each new media message (vision needs only current photo)
     media_paths: List[str] = []
+    vision_analyses: List[dict] = []  # Store vision analysis results
     draft_listing_id: Optional[str] = None
 
     if has_media:
@@ -597,15 +687,37 @@ async def whatsapp_webhook(
 
         for idx, (url, mtype, msid, media_sid) in enumerate(media_items):
             logger.info(f"📸 Processing media {idx+1}/{len(media_items)}: {url[:80]}...")
-            uploaded_path = await process_media(phone_number, draft_listing_id, url, mtype, msid, media_sid)
-            if uploaded_path:
+            result = await process_media(phone_number, draft_listing_id, url, mtype, msid, media_sid)
+            if result:
                 uploaded_any = True
-                media_paths.append(uploaded_path)
-                logger.info(f"✅ Media uploaded: {uploaded_path}")
+                media_paths.append(result["path"])
+                if result.get("analysis"):
+                    vision_analyses.append(result["analysis"])
+                logger.info(f"✅ Media uploaded: {result['path']}")
+                if result.get("analysis"):
+                    logger.info(f"🔍 Vision analysis: {result['analysis'].get('product', 'N/A')}")
             else:
                 logger.warning(f"Media upload failed for {url}")
 
         if uploaded_any and media_paths:
+            # Build vision summary for conversation context
+            vision_summary = ""
+            for idx, analysis in enumerate(vision_analyses, 1):
+                product = analysis.get("product", "")
+                condition = analysis.get("condition", "")
+                features = analysis.get("features", [])
+                if product:
+                    vision_summary += f"\n📷 Fotoğraf {idx}: {product}"
+                if condition:
+                    vision_summary += f" - {condition}"
+                if features and isinstance(features, list):
+                    vision_summary += f" | Özellikler: {', '.join(features[:3])}"
+            
+            # Add vision analysis to conversation history
+            if vision_summary:
+                vision_note = f"[VISION_ANALYSIS]{vision_summary}"
+                add_to_conversation_history(phone_number, "assistant", vision_note)
+            
             media_note = f"[SYSTEM_MEDIA_NOTE] DRAFT_LISTING_ID={draft_listing_id} | MEDIA_PATHS={media_paths}"
             add_to_conversation_history(phone_number, "assistant", media_note)
         else:
