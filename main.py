@@ -57,10 +57,11 @@ WHATSAPP_LOCAL_DETAIL_SHORTCIRCUIT = os.getenv("WHATSAPP_LOCAL_DETAIL_SHORTCIRCU
 
 
 def _extract_last_media_context(history: List[dict]) -> tuple[Optional[str], List[str]]:
-    """Fetch the latest draft id and ALL media paths from prior system notes."""
+    """Fetch ONLY the most recent draft id and media paths from system notes."""
     draft_id = None
     all_media_paths: List[str] = []
 
+    # Only look at the most recent SYSTEM_MEDIA_NOTE (not all historical ones)
     for msg in reversed(history or []):
         text = msg.get("content") if isinstance(msg, dict) else None
         if not isinstance(text, str):
@@ -68,22 +69,21 @@ def _extract_last_media_context(history: List[dict]) -> tuple[Optional[str], Lis
         if "[SYSTEM_MEDIA_NOTE]" not in text:
             continue
 
-        # Get draft_id from first (most recent) SYSTEM_MEDIA_NOTE
-        if "DRAFT_LISTING_ID=" in text and not draft_id:
+        # Found the most recent media note - extract and stop
+        if "DRAFT_LISTING_ID=" in text:
             draft_id = text.split("DRAFT_LISTING_ID=", 1)[1].split("|")[0].strip()
 
-        # Collect ALL media paths from all SYSTEM_MEDIA_NOTE entries
         if "MEDIA_PATHS=" in text:
             raw_paths = text.split("MEDIA_PATHS=", 1)[1].split("|")[0].strip()
             try:
                 parsed = ast.literal_eval(raw_paths)
                 if isinstance(parsed, list):
-                    # Add paths that aren't already in the list (avoid duplicates)
-                    for p in parsed:
-                        if isinstance(p, str) and p not in all_media_paths:
-                            all_media_paths.append(p)
+                    all_media_paths = [p for p in parsed if isinstance(p, str)]
             except Exception:
                 pass
+        
+        # IMPORTANT: Stop after first (most recent) media note
+        break
 
     return draft_id, all_media_paths
 
