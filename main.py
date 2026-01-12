@@ -364,20 +364,27 @@ def get_search_cache(phone_number: str) -> Optional[List[dict]]:
 
 
 def parse_search_cache_block(text: str) -> tuple[str, Optional[List[dict]]]:
-    """Strip [SEARCH_CACHE]{json} block from text and return remaining text and parsed results."""
+    """Strip [SEARCH_CACHE][json] block from text and return remaining text and parsed results."""
     if not text:
         return text, None
-    match = re.search(r"\[SEARCH_CACHE\](\{.*\})", text, flags=re.DOTALL)
+    # Match both formats: [SEARCH_CACHE]{...} and [SEARCH_CACHE][...]
+    match = re.search(r"\[SEARCH_CACHE\](\[.*?\]|\{.*?\})", text, flags=re.DOTALL)
     if not match:
         return text, None
     json_part = match.group(1)
     try:
         parsed = ast.literal_eval(json_part)
-        if isinstance(parsed, dict) and isinstance(parsed.get("results"), list):
+        # Handle both dict format {"results": [...]} and direct array [...]
+        if isinstance(parsed, list):
+            # Direct array format
+            stripped = text.replace(match.group(0), "").strip()
+            return stripped, parsed
+        elif isinstance(parsed, dict) and isinstance(parsed.get("results"), list):
+            # Dict format with "results" key
             stripped = text.replace(match.group(0), "").strip()
             return stripped, parsed.get("results")
-    except Exception:
-        logger.warning("Failed to parse SEARCH_CACHE block")
+    except Exception as e:
+        logger.warning(f"Failed to parse SEARCH_CACHE block: {e}")
     stripped = text.replace(match.group(0), "").strip()
     return stripped, None
 
