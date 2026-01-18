@@ -504,6 +504,10 @@ def build_last_search_results_note(results: List[dict], max_items: int = 10) -> 
     """
     if not results:
         return ""
+    
+    # Emoji number mapping for better visibility (matching backend format)
+    emoji_numbers = {1: "1️⃣", 2: "2️⃣", 3: "3️⃣", 4: "4️⃣", 5: "5️⃣", 6: "6️⃣", 7: "7️⃣", 8: "8️⃣", 9: "9️⃣", 10: "🔟"}
+    
     parts: List[str] = []
     for i, item in enumerate(results[:max_items], start=1):
         if not isinstance(item, dict):
@@ -513,7 +517,8 @@ def build_last_search_results_note(results: List[dict], max_items: int = 10) -> 
         if not listing_id:
             continue
         title_s = str(title).replace("|", " ").replace("\n", " ").strip()
-        parts.append(f"#{i} id={listing_id} title={title_s}")
+        num_emoji = emoji_numbers.get(i, f"#{i}")
+        parts.append(f"{num_emoji} id={listing_id} title={title_s}")
     if not parts:
         return ""
     return "[LAST_SEARCH_RESULTS] " + " | ".join(parts)
