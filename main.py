@@ -117,7 +117,10 @@ async def download_media(media_url: str, media_type: Optional[str], message_sid:
             try:
                 media_obj = twilio_client.messages(message_sid).media(media_sid).fetch()
                 # Twilio returns uri like /2010-04-01/Accounts/AC.../Messages/MM.../Media/ME....json
-                fallback_url = f"https://api.twilio.com{media_obj.uri.replace('.json','')}"
+                if media_obj.uri:
+                    fallback_url = f"https://api.twilio.com{media_obj.uri.replace('.json','')}"
+                else:
+                    raise ValueError("Media object has no URI")
                 logger.info(f"🔄 Fallback URL: {fallback_url}")
                 async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
                     resp = await client.get(fallback_url, auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN))
@@ -157,7 +160,12 @@ def _compress_image(content: bytes, media_type: Optional[str]) -> Optional[tuple
         w, h = img.size
         if max(w, h) > max_side:
             ratio = max_side / float(max(w, h))
-            img = img.resize((int(w * ratio), int(h * ratio)), Image.LANCZOS)
+            # Use Resampling.LANCZOS for newer Pillow, fallback to LANCZOS for older versions
+            try:
+                from PIL.Image import Resampling
+                img = img.resize((int(w * ratio), int(h * ratio)), Resampling.LANCZOS)
+            except ImportError:
+                img = img.resize((int(w * ratio), int(h * ratio)), Image.LANCZOS)
 
         target_bytes = 900_000  # ~0.9 MB target to stay well under Twilio limits
         quality = 85
@@ -893,7 +901,7 @@ async def call_agent_backend(
     user_id: str, 
     conversation_history: List[dict],
     media_paths: Optional[List[str]] = None,
-    media_type: str = None,
+    media_type: Optional[str] = None,
     draft_listing_id: Optional[str] = None
 ) -> str:
     """
@@ -943,8 +951,8 @@ async def call_agent_backend(
                 headers={
                     "Content-Type": "application/json",
                     # Supabase Edge Functions: service role key for server-to-server calls
-                    "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
-                    "apikey": SUPABASE_SERVICE_KEY,
+                    "Authorization": f"Bearer {SUPABASE_SERVICE_KEY or ''}",
+                    "apikey": SUPABASE_SERVICE_KEY or "",
                 }
             )
             
