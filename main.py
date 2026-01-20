@@ -27,11 +27,11 @@ logger = logging.getLogger(__name__)
 app = FastAPI(title="Pazarglobal WhatsApp Bridge")
 
 # Environment variables
-AGENT_BACKEND_URL = os.getenv("AGENT_BACKEND_URL", "https://pazarglobal-agent-backend-production-4ec8.up.railway.app")
+AGENT_BACKEND_URL = os.getenv("AGENT_BACKEND_URL", "https://pazarglobal-agent-production.up.railway.app")
 
 # Edge Function URL (Traffic Controller)
 # IMPORTANT: Must point to your Supabase project, otherwise WhatsApp traffic bypasses the security gate.
-EDGE_FUNCTION_URL = os.getenv("EDGE_FUNCTION_URL", "https://YOUR_PROJECT.supabase.co/functions/v1/whatsapp-traffic-controller")
+EDGE_FUNCTION_URL = os.getenv("EDGE_FUNCTION_URL", "https://snovwbffwvmkgjulrtsm.supabase.co/functions/v1/whatsapp-traffic-controller")
 
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
