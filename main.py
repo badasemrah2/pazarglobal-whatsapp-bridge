@@ -609,6 +609,12 @@ def send_twilio_message(phone_number: str, body_text: str) -> None:
         return
 
     media_urls = _extract_image_urls(body_text)
+    
+    # Log extracted URLs for debugging
+    if media_urls:
+        logger.info(f"📸 Extracted {len(media_urls)} media URLs:")
+        for i, url in enumerate(media_urls):
+            logger.info(f"  [{i+1}] {url}")
 
     # Twilio WhatsApp limit: body + media_url combined max 1600 chars
     MAX_WHATSAPP_LENGTH = 1600
@@ -622,13 +628,31 @@ def send_twilio_message(phone_number: str, body_text: str) -> None:
         )
         truncated_response = body_text[:MAX_BODY_LENGTH - 60] + "\n\n...(devamı için daha spesifik arama yapın)"
 
-    message = twilio_client.messages.create(
-        from_=f'whatsapp:{TWILIO_WHATSAPP_NUMBER}',
-        body=truncated_response,
-        media_url=media_urls if media_urls else None,
-        to=f'whatsapp:{phone_number}'
-    )
-    logger.info(f"✅ Twilio message sent: {message.sid}")
+    try:
+        message = twilio_client.messages.create(
+            from_=f'whatsapp:{TWILIO_WHATSAPP_NUMBER}',
+            body=truncated_response,
+            media_url=media_urls if media_urls else None,
+            to=f'whatsapp:{phone_number}'
+        )
+        logger.info(f"✅ Twilio message sent: {message.sid}")
+    except Exception as e:
+        logger.error(f"❌ Twilio send error: {e}")
+        # Retry without media if media_urls caused the error
+        if media_urls:
+            logger.warning("🔄 Retrying without media...")
+            try:
+                message = twilio_client.messages.create(
+                    from_=f'whatsapp:{TWILIO_WHATSAPP_NUMBER}',
+                    body=truncated_response,
+                    to=f'whatsapp:{phone_number}'
+                )
+                logger.info(f"✅ Message sent without media: {message.sid}")
+            except Exception as retry_error:
+                logger.error(f"❌ Retry also failed: {retry_error}")
+                raise
+        else:
+            raise
 # ================================================
 
 
