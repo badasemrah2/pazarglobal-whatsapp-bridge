@@ -809,6 +809,15 @@ async def whatsapp_webhook(
 
     try:
         user_message = Body
+        
+        # If message is empty but we have vision analysis, use it as the message
+        if not user_message and vision_analyses:
+            # Use the first media's product name as the search query
+            first_analysis = vision_analyses[0]
+            product_name = first_analysis.get("product", "")
+            if product_name:
+                user_message = product_name
+                logger.info(f"🔍 Using vision analysis as message: {user_message}")
 
         # Get conversation history (previous messages only, NOT current message)
         conversation_history = get_conversation_history(phone_number)
