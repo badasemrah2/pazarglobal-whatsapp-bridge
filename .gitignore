@@ -14,3 +14,12 @@ build/
 .env
 .DS_Store
 *.log
+
+# Test files
+test_*.py
+.pytest_cache/
+
+# Documentation/Notes (not needed in production)
+*.txt
+agennt builder sdk agent kodları.txt
+agent builder sdk python versiyon.txt
