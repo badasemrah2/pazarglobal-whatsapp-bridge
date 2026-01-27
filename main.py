@@ -231,6 +231,27 @@ def _extract_image_urls(text: str) -> List[str]:
     return images
 
 
+def _normalize_whatsapp_number(raw: str) -> str:
+    """Ensure Twilio WhatsApp numbers are prefixed exactly once."""
+    if not raw:
+        return ""
+    return raw if raw.startswith("whatsapp:") else f"whatsapp:{raw}"
+
+
+def _strip_media_from_text(text: str, media_urls: List[str]) -> str:
+    """Remove markdown image tags and media URLs from body text."""
+    if not text:
+        return text
+
+    cleaned = re.sub(r"!\[.*?\]\((https?://[^)]+)\)", "", text)
+    if media_urls:
+        for url in media_urls:
+            cleaned = cleaned.replace(url, "")
+
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
+
+
 async def upload_to_supabase(path: str, content: bytes, content_type: str) -> bool:
     if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
         logger.warning("Supabase credentials missing, cannot upload media")
@@ -629,19 +650,23 @@ def send_twilio_message(phone_number: str, body_text: str) -> None:
     MEDIA_URL_OVERHEAD = len(media_urls) * 120  # Reserve 120 chars per media URL
     MAX_BODY_LENGTH = MAX_WHATSAPP_LENGTH - MEDIA_URL_OVERHEAD - 100  # Extra safety margin
 
-    truncated_response = body_text
-    if len(body_text) > MAX_BODY_LENGTH:
+    cleaned_body = _strip_media_from_text(body_text, media_urls)
+    if not cleaned_body and media_urls:
+        cleaned_body = "Sonuçlar görseller olarak gönderildi. Daha spesifik arama yapabilirsiniz."
+
+    truncated_response = cleaned_body
+    if len(cleaned_body) > MAX_BODY_LENGTH:
         logger.warning(
-            f"⚠️ Response too long ({len(body_text)} chars), truncating to {MAX_BODY_LENGTH} (with {len(media_urls)} media)"
+            f"⚠️ Response too long ({len(cleaned_body)} chars), truncating to {MAX_BODY_LENGTH} (with {len(media_urls)} media)"
         )
-        truncated_response = body_text[:MAX_BODY_LENGTH - 60] + "\n\n...(devamı için daha spesifik arama yapın)"
+        truncated_response = cleaned_body[:MAX_BODY_LENGTH - 60] + "\n\n...(devamı için daha spesifik arama yapın)"
 
     try:
         message = twilio_client.messages.create(
-            from_=f'whatsapp:{TWILIO_WHATSAPP_NUMBER}',
+            from_=_normalize_whatsapp_number(TWILIO_WHATSAPP_NUMBER),
             body=truncated_response,
             media_url=media_urls if media_urls else None,
-            to=f'whatsapp:{phone_number}'
+            to=_normalize_whatsapp_number(phone_number)
         )
         logger.info(f"✅ Twilio message sent: {message.sid}")
     except Exception as e:
