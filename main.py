@@ -500,28 +500,52 @@ def get_search_cache(phone_number: str) -> Optional[List[dict]]:
 
 
 def parse_search_cache_block(text: str) -> tuple[str, Optional[List[dict]]]:
-    """Strip [SEARCH_CACHE][json] block from text and return remaining text and parsed results."""
+    """Strip [SEARCH_CACHE] JSON block from text and return remaining text and parsed results."""
     if not text:
         return text, None
-    # Match both formats: [SEARCH_CACHE]{...} and [SEARCH_CACHE][...]
-    match = re.search(r"\[SEARCH_CACHE\](\[.*?\]|\{.*?\})", text, flags=re.DOTALL)
-    if not match:
+
+    marker = "[SEARCH_CACHE]"
+    idx = text.find(marker)
+    if idx == -1:
         return text, None
-    json_part = match.group(1)
+
+    stripped = text[:idx].rstrip()
+    json_part = text[idx + len(marker):].strip()
+    if not json_part:
+        return stripped, None
+
+    def _extract_balanced_json(raw: str) -> Optional[str]:
+        first = raw[0]
+        if first not in "[{":
+            return None
+        stack = [first]
+        for i, ch in enumerate(raw[1:], start=1):
+            if ch in "[{":
+                stack.append(ch)
+            elif ch in "]}":
+                if not stack:
+                    break
+                last = stack.pop()
+                if (last == "[" and ch != "]") or (last == "{" and ch != "}"):
+                    return None
+                if not stack:
+                    return raw[: i + 1]
+        return None
+
+    raw_json = _extract_balanced_json(json_part) or json_part
     try:
-        parsed = ast.literal_eval(json_part)
-        # Handle both dict format {"results": [...]} and direct array [...]
-        if isinstance(parsed, list):
-            # Direct array format
-            stripped = text.replace(match.group(0), "").strip()
-            return stripped, parsed
-        elif isinstance(parsed, dict) and isinstance(parsed.get("results"), list):
-            # Dict format with "results" key
-            stripped = text.replace(match.group(0), "").strip()
-            return stripped, parsed.get("results")
-    except Exception as e:
-        logger.warning(f"Failed to parse SEARCH_CACHE block: {e}")
-    stripped = text.replace(match.group(0), "").strip()
+        parsed = json.loads(raw_json)
+    except Exception:
+        try:
+            parsed = ast.literal_eval(raw_json)
+        except Exception as e:
+            logger.warning(f"Failed to parse SEARCH_CACHE block: {e}")
+            return stripped, None
+
+    if isinstance(parsed, list):
+        return stripped, parsed
+    if isinstance(parsed, dict) and isinstance(parsed.get("results"), list):
+        return stripped, parsed.get("results")
     return stripped, None
 
 
