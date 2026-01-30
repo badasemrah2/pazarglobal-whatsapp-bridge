@@ -190,7 +190,11 @@ def _compress_image(content: bytes, media_type: Optional[str]) -> Optional[tuple
 
 
 def _extract_image_urls(text: str) -> List[str]:
-    """Pick first few image URLs (Supabase public) from agent response."""
+    """Pick first few image URLs (Supabase public) from agent response.
+
+    Note: WhatsApp via Twilio is most reliable with JPG/PNG media. We skip WEBP
+    links to avoid silent delivery failures.
+    """
     if not text:
         return []
     
@@ -210,6 +214,9 @@ def _extract_image_urls(text: str) -> List[str]:
             continue
         lower = clean_url.lower()
         if ("/storage/v1/object/" in lower) or lower.endswith(('.jpg', '.jpeg', '.png', '.webp')):
+            # Drop WEBP for WhatsApp reliability
+            if lower.endswith('.webp') or '.webp' in lower:
+                continue
             images.append(clean_url)
             seen.add(clean_url)
         if len(images) >= MAX_MEDIA_PER_MESSAGE:
@@ -223,6 +230,8 @@ def _extract_image_urls(text: str) -> List[str]:
                 continue
             lower = clean_url.lower()
             if ("/storage/v1/object/" in lower) or lower.endswith(('.jpg', '.jpeg', '.png', '.webp')):
+                if lower.endswith('.webp') or '.webp' in lower:
+                    continue
                 images.append(clean_url)
                 seen.add(clean_url)
             if len(images) >= MAX_MEDIA_PER_MESSAGE:
