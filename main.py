@@ -664,11 +664,11 @@ def send_typing_indicator(phone_number: str, is_typing: bool) -> None:
         logger.warning(f"⚠️ Failed to send typing indicator: {e}")
 
 
-def send_twilio_message(phone_number: str, body_text: str) -> None:
+def send_twilio_message(phone_number: str, body_text: str) -> bool:
     """Send WhatsApp message via Twilio with length and media safeguards."""
     if not twilio_client:
         logger.warning("⚠️ Twilio not configured, response not sent")
-        return
+        return False
 
     media_urls = _extract_image_urls(body_text)
     
@@ -702,6 +702,7 @@ def send_twilio_message(phone_number: str, body_text: str) -> None:
             to=_normalize_whatsapp_number(phone_number)
         )
         logger.info(f"✅ Twilio message sent: {message.sid}")
+        return True
     except Exception as e:
         logger.error(f"❌ Twilio send error: {e}")
         # Retry without media if media_urls caused the error
@@ -714,11 +715,11 @@ def send_twilio_message(phone_number: str, body_text: str) -> None:
                     to=f'whatsapp:{phone_number}'
                 )
                 logger.info(f"✅ Message sent without media: {message.sid}")
+                return True
             except Exception as retry_error:
                 logger.error(f"❌ Retry also failed: {retry_error}")
-                raise
-        else:
-            raise
+                return False
+        return False
 # ================================================
 
 
@@ -794,8 +795,12 @@ async def whatsapp_webhook(
 
     if has_media:
         logger.info(f"📸 Media attached count: {len(media_items)}")
-        draft_listing_id = str(uuid.uuid4())  # Always create new draft for vision analysis
-        logger.info(f"📋 Draft listing ID: {draft_listing_id}")
+        if prev_draft_id:
+            draft_listing_id = prev_draft_id
+            logger.info(f"📋 Reusing draft listing ID: {draft_listing_id}")
+        else:
+            draft_listing_id = str(uuid.uuid4())
+            logger.info(f"📋 New draft listing ID: {draft_listing_id}")
         uploaded_any = False
 
         for idx, (url, mtype, msid, media_sid) in enumerate(media_items):
@@ -876,14 +881,10 @@ async def whatsapp_webhook(
     try:
         user_message = Body
         
-        # If message is empty but we have vision analysis, use it as the message
-        if not user_message and vision_analyses:
-            # Use the first media's product name as the search query
-            first_analysis = vision_analyses[0]
-            product_name = first_analysis.get("product", "")
-            if product_name:
-                user_message = product_name
-                logger.info(f"🔍 Using vision analysis as message: {user_message}")
+        # If message is empty but we have media, avoid turning it into a search query
+        if not user_message and has_media:
+            user_message = "Fotoğraf gönderdim"
+            logger.info("📝 Using neutral message for media-only input")
 
         # Get conversation history (previous messages only, NOT current message)
         conversation_history = get_conversation_history(phone_number)
@@ -935,10 +936,13 @@ async def whatsapp_webhook(
         add_to_conversation_history(phone_number, "assistant", agent_response)
         
         # Step 3: Send response back via Twilio WhatsApp
-        send_twilio_message(phone_number, agent_response)
+        sent = send_twilio_message(phone_number, agent_response)
         
-        # Return TwiML response (Twilio expects this)
+        # Return TwiML response (Twilio expects this). If Twilio REST send failed,
+        # fall back to TwiML message to ensure user sees a response.
         resp = MessagingResponse()
+        if not sent:
+            resp.message(agent_response)
         return Response(content=str(resp), media_type="application/xml")
         
     except Exception as e:
