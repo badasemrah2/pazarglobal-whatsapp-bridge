@@ -207,13 +207,26 @@ def _extract_image_urls(text: str) -> List[str]:
     images: List[str] = []
     seen = set()
     
+    def _is_valid_image_url(url: str) -> bool:
+        lower = url.lower()
+        # Drop placeholder/invalid URLs
+        if lower.endswith("/url") or "/url" == lower.rsplit("/", 1)[-1]:
+            return False
+        if any(token in lower for token in ["{", "}", " "]):
+            return False
+        # Accept Supabase storage URLs with image extensions
+        if "/storage/v1/object/" in lower and lower.endswith((".jpg", ".jpeg", ".png", ".webp")):
+            return True
+        # Accept direct image URLs with extensions
+        return lower.endswith((".jpg", ".jpeg", ".png", ".webp"))
+
     # Prioritize markdown images (cleaner extraction)
     for url in markdown_images:
         clean_url = url.rstrip(').,;')
         if clean_url in seen:
             continue
         lower = clean_url.lower()
-        if ("/storage/v1/object/" in lower) or lower.endswith(('.jpg', '.jpeg', '.png', '.webp')):
+        if _is_valid_image_url(clean_url):
             # Drop WEBP for WhatsApp reliability
             if lower.endswith('.webp') or '.webp' in lower:
                 continue
@@ -229,7 +242,7 @@ def _extract_image_urls(text: str) -> List[str]:
             if clean_url in seen:
                 continue
             lower = clean_url.lower()
-            if ("/storage/v1/object/" in lower) or lower.endswith(('.jpg', '.jpeg', '.png', '.webp')):
+            if _is_valid_image_url(clean_url):
                 if lower.endswith('.webp') or '.webp' in lower:
                     continue
                 images.append(clean_url)
