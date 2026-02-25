@@ -390,6 +390,146 @@ JSON formatında cevap ver:
         return None
 
 
+async def _log_image_safety_flag_bridge(
+    flag_type: str,
+    confidence: str,
+    message: str,
+    phone_number: Optional[str] = None,
+    image_url: Optional[str] = None,
+) -> None:
+    """
+    Bridge tarafından engellenen görselleri Supabase image_safety_flags tablosuna kaydeder.
+    Hata olsa bile akışı kesmez (fire-and-forget).
+    """
+    if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
+        logger.warning("⚠️ Supabase config eksik, image_safety_flags kaydedilemedi")
+        return
+    try:
+        payload: dict = {
+            "flag_type": flag_type,
+            "confidence": confidence,
+            "message": message,
+            "status": "pending",
+        }
+        if phone_number:
+            # Bridge'de UUID yok, phone_number'ı kayıt mesajına ekle
+            payload["message"] = f"[WhatsApp:{phone_number}] {message}"
+        if image_url:
+            payload["image_url"] = image_url[:2048]
+
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            await client.post(
+                f"{SUPABASE_URL}/rest/v1/image_safety_flags",
+                headers={
+                    "apikey": SUPABASE_SERVICE_KEY,
+                    "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+                    "Content-Type": "application/json",
+                    "Prefer": "return=minimal",
+                },
+                json=payload,
+            )
+        logger.info(f"🚩 image_safety_flags kaydedildi: {flag_type} | phone={phone_number}")
+    except Exception as e:
+        logger.error(f"❌ image_safety_flags loglama hatası (akış devam ediyor): {e}")
+
+
+async def _check_image_safety_moderation(image_bytes: bytes, content_type: str, phone_number: Optional[str] = None) -> dict:
+    """Run OpenAI Moderation API on image bytes (base64 encoded) before Supabase upload.
+    
+    FAIL-CLOSED: Any error or empty response blocks the image.
+    Engellenen görseller image_safety_flags tablosuna kaydedilir.
+    
+    Returns:
+        {"safe": bool, "blocked_reason": str|None}
+    """
+    openai_key = os.getenv("OPENAI_API_KEY")
+    if not openai_key:
+        logger.error("❌ OPENAI_API_KEY not set — cannot run moderation (fail-closed, blocking image)")
+        await _log_image_safety_flag_bridge(
+            flag_type="moderation_not_configured",
+            confidence="n/a",
+            message="OPENAI_API_KEY eksik, tüm görseller engellendi.",
+            phone_number=phone_number,
+        )
+        return {"safe": False, "blocked_reason": "moderation_not_configured"}
+
+    import base64
+    # Encode image as data URI for moderation API
+    b64 = base64.b64encode(image_bytes).decode("utf-8")
+    mime = content_type if content_type.startswith("image/") else "image/jpeg"
+    data_uri = f"data:{mime};base64,{b64}"
+
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            response = await client.post(
+                "https://api.openai.com/v1/moderations",
+                headers={
+                    "Authorization": f"Bearer {openai_key}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "model": "omni-moderation-latest",
+                    "input": [
+                        {"type": "image_url", "image_url": {"url": data_uri}}
+                    ]
+                }
+            )
+
+        if not response.is_success:
+            logger.error(f"❌ Moderation API HTTP error {response.status_code} (fail-closed, blocking image)")
+            await _log_image_safety_flag_bridge(
+                flag_type=f"moderation_http_{response.status_code}",
+                confidence="unknown",
+                message=f"Moderation API HTTP hatası: {response.status_code}",
+                phone_number=phone_number,
+            )
+            return {"safe": False, "blocked_reason": f"moderation_http_{response.status_code}"}
+
+        data = response.json()
+        results = data.get("results", [])
+        if not results:
+            logger.error("❌ Moderation API returned empty results (fail-closed, blocking image)")
+            await _log_image_safety_flag_bridge(
+                flag_type="moderation_empty_response",
+                confidence="unknown",
+                message="Moderation API boş yanıt döndürdü (fail-closed).",
+                phone_number=phone_number,
+            )
+            return {"safe": False, "blocked_reason": "moderation_empty_response"}
+
+        result = results[0]
+        flagged = result.get("flagged", False)
+
+        if flagged:
+            cats = result.get("categories", {})
+            scores = result.get("category_scores", {})
+            triggered = [k for k, v in cats.items() if v]
+            # En yüksek skoru bul
+            max_score = max((scores.get(k, 0) for k in triggered), default=0) if triggered else 0
+            blocked_reason = ", ".join(triggered) if triggered else "policy_violation"
+            logger.warning(f"⚠️ Image blocked by moderation. Categories: {triggered}")
+            await _log_image_safety_flag_bridge(
+                flag_type=blocked_reason,
+                confidence=f"{max_score:.2f}",
+                message=f"Görsel engellendi: {blocked_reason}",
+                phone_number=phone_number,
+            )
+            return {"safe": False, "blocked_reason": blocked_reason}
+
+        logger.info("✅ Image passed moderation check")
+        return {"safe": True, "blocked_reason": None}
+
+    except Exception as e:
+        logger.error(f"❌ Moderation API exception (fail-closed, blocking image): {e}")
+        await _log_image_safety_flag_bridge(
+            flag_type="moderation_api_error",
+            confidence="unknown",
+            message=f"Moderation API exception (fail-closed): {str(e)[:200]}",
+            phone_number=phone_number,
+        )
+        return {"safe": False, "blocked_reason": f"moderation_error: {e}"}
+
+
 async def process_media(
     user_id: str,
     listing_uuid: str,
@@ -398,10 +538,14 @@ async def process_media(
     message_sid: Optional[str] = None,
     media_sid: Optional[str] = None,
 ) -> Optional[dict]:
-    """Process media: download, compress, upload to Supabase, and analyze with Vision API.
+    """Process media: download, compress, safety check, upload to Supabase, analyze.
+    
+    Safety gate runs BEFORE Supabase upload (fail-closed).
+    Illegal content (weapons, etc.) never reaches storage.
     
     Returns:
         dict with 'path' and 'analysis', or None if processing failed
+        dict with 'blocked': True and 'blocked_reason' if content is unsafe
     """
     logger.info(f"🔄 Processing media: url={media_url[:80]}..., sid={message_sid}, media_sid={media_sid}")
     
@@ -411,11 +555,25 @@ async def process_media(
         return None
     content, ctype = downloaded
 
-    logger.info(f"🗜️ Compressing image ({len(content)} bytes)...")
+    logger.info(f"🗄️ Compressing image ({len(content)} bytes)...")
     compressed = _compress_image(content, ctype)
     if compressed:
         content, ctype = compressed
         logger.info(f"✅ Compressed to {len(content)} bytes")
+
+    # ███ SAFETY GATE: Run BEFORE upload to Supabase ███
+    # Fail-closed: illegal/unsafe content is NEVER stored.
+    logger.info("🔒 Running content moderation before upload...")
+    safety = await _check_image_safety_moderation(content, ctype, phone_number=user_id)
+    if not safety["safe"]:
+        reason = safety.get("blocked_reason", "policy_violation")
+        logger.warning(f"🚫 Image BLOCKED by safety gate. Reason: {reason}. NOT uploading to Supabase.")
+        return {
+            "blocked": True,
+            "blocked_reason": reason,
+            "path": None,
+            "analysis": None,
+        }
 
     storage_path = _build_storage_path(user_id, listing_uuid, ctype)
     logger.info(f"📤 Uploading to Supabase: {storage_path}")
@@ -427,11 +585,12 @@ async def process_media(
     
     logger.info(f"✅ Media uploaded successfully: {storage_path}")
     
-    # Now analyze the uploaded image with Vision API
+    # Analyze the uploaded image with Vision API (product recognition only)
     full_image_url = f"{SUPABASE_URL}/storage/v1/object/public/{SUPABASE_STORAGE_BUCKET}/{storage_path}"
     analysis = await analyze_image_with_vision(full_image_url)
     
     return {
+        "blocked": False,
         "path": storage_path,
         "analysis": analysis
     }
@@ -815,11 +974,24 @@ async def whatsapp_webhook(
             draft_listing_id = str(uuid.uuid4())
             logger.info(f"📋 New draft listing ID: {draft_listing_id}")
         uploaded_any = False
+        blocked_any = False
+        blocked_reason_msg = ""
 
         for idx, (url, mtype, msid, media_sid) in enumerate(media_items):
             logger.info(f"📸 Processing media {idx+1}/{len(media_items)}: {url[:80]}...")
             result = await process_media(phone_number, draft_listing_id, url, mtype, msid, media_sid)
-            if result:
+            if result and result.get("blocked"):
+                # Image blocked by safety gate — notify user immediately and stop processing
+                blocked_any = True
+                reason = result.get("blocked_reason", "policy_violation")
+                logger.warning(f"🚫 Media blocked by safety gate: {reason}")
+                blocked_reason_msg = (
+                    "🚫 Gönderdiğiniz görsel içerik politikamıza aykırı olduğu için kabul edilemez. "
+                    "Silah, şiddet, uyuşturucu veya uygunsuz içerik içeren görseller platforma yüklenemez. "
+                    "Lütfen farklı bir ürün görseli gönderin."
+                )
+                break
+            elif result and result.get("path"):
                 uploaded_any = True
                 media_paths.append(result["path"])
                 if result.get("analysis"):
@@ -829,6 +1001,13 @@ async def whatsapp_webhook(
                     logger.info(f"🔍 Vision analysis: {result['analysis'].get('product', 'N/A')}")
             else:
                 logger.warning(f"Media upload failed for {url}")
+
+        # If any image was blocked, inform user and abort this request
+        if blocked_any:
+            send_twilio_message(phone_number, blocked_reason_msg)
+            add_to_conversation_history(phone_number, "assistant", blocked_reason_msg)
+            resp = MessagingResponse()
+            return Response(content=str(resp), media_type="application/xml")
 
         if uploaded_any and media_paths:
             # Build vision summary for conversation context
