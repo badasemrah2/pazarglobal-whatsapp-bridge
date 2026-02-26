@@ -6,6 +6,16 @@ WhatsApp kullanıcılarını PazarGlobal AI Agent Backend'e bağlayan webhook se
 Twilio WhatsApp Business API entegrasyonu ile kullanıcıların WhatsApp üzerinden
 ilan oluşturma, arama ve yönetme işlemlerini gerçekleştirmesini sağlar.
 
+## ✅ Production Readiness (Şu Anki Durum)
+
+- ✅ Railway üzerinde canlı çalışıyor
+- ✅ Twilio webhook → Supabase Edge → Agent akışı aktif
+- ✅ Medya işleme ve depolama akışı aktif
+- ✅ Görsel güvenlik kontrolü upload öncesi uygulanıyor
+- ⚠️ Gelişmiş yük testleri ve otomatik geri alma (rollback) mekanizmaları sınırlı
+
+> Özet: Bridge, production trafiği için çalışır durumda; ölçek ve gözlemlenebilirlik adımlarıyla güçlendirilmeli.
+
 ---
 
 ## 📋 İçindekiler
@@ -64,6 +74,12 @@ ilan oluşturma, arama ve yönetme işlemlerini gerçekleştirmesini sağlar.
 │                                                              │
 └──────────────────────────────────────────────────────────────┘
 ```
+
+## 🔄 Güncel Akış Notu
+
+Bridge, doğrudan Agent'a gitmek yerine öncelikle Supabase Edge Function (`whatsapp-traffic-controller`) çağırır.
+Bu katman PIN doğrulama ve 10 dakika session gate gibi kontrolleri uygular; ardından Agent API `/agent/run`
+endpointine iletir.
 
 **Teknoloji Stack:**
 
@@ -271,6 +287,21 @@ PORT=8080
 ```bash
 curl https://your-railway-url.up.railway.app
 ```
+
+## 🚀 Go-Live Checklist
+
+- [ ] Twilio webhook URL doğru bridge domainine işaret ediyor
+- [ ] `EDGE_FUNCTION_URL` doğru proje/ref ile güncel
+- [ ] `SUPABASE_SERVICE_KEY` ve bucket erişimi doğrulandı
+- [ ] Örnek metin + medya mesajı ile uçtan uca test yapıldı
+- [ ] Moderasyon blok senaryosu test edildi
+
+## 🗺️ Gelecek Özellikler
+
+- Kuyruk tabanlı retry/backoff (geçici ağ hataları için)
+- Daha zengin observability (request trace ID zinciri)
+- Büyük medya için adaptif sıkıştırma/işlem politikası
+- WhatsApp etkileşim şablonlarının genişletilmesi
 
 Expected:
 
