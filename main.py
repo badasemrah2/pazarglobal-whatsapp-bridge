@@ -459,6 +459,48 @@ async def _check_image_safety_moderation(image_bytes: bytes, content_type: str, 
     mime = content_type if content_type.startswith("image/") else "image/jpeg"
     data_uri = f"data:{mime};base64,{b64}"
 
+    async def _is_allowed_apparel_exception_data_uri(image_data_uri: str) -> bool:
+        try:
+            prompt = (
+                "Bu görsel e-ticaret ürün istisnasına giriyor mu? "
+                "Sadece iç çamaşırı/mayo/bikini gibi legal giyim ürünü satışı için uygun ürün fotoğrafıysa true döndür. "
+                "Reşit olmayan kişi, pornografik çıplaklık, şiddet, silah/bomba veya yasa dışı içerik varsa false döndür. "
+                "Emin değilsen false döndür. "
+                "Sadece JSON döndür: {\"allow_exception\": true|false, \"reason\": \"...\"}"
+            )
+            async with httpx.AsyncClient(timeout=20.0) as client:
+                resp = await client.post(
+                    "https://api.openai.com/v1/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {openai_key}",
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "model": "gpt-4o-mini",
+                        "response_format": {"type": "json_object"},
+                        "temperature": 0,
+                        "max_tokens": 120,
+                        "messages": [
+                            {
+                                "role": "user",
+                                "content": [
+                                    {"type": "text", "text": prompt},
+                                    {"type": "image_url", "image_url": {"url": image_data_uri, "detail": "low"}},
+                                ],
+                            }
+                        ],
+                    },
+                )
+            if not resp.is_success:
+                return False
+            payload = resp.json()
+            content = payload.get("choices", [{}])[0].get("message", {}).get("content", "{}")
+            parsed = json.loads(content)
+            return bool(parsed.get("allow_exception") is True)
+        except Exception as ex:
+            logger.warning(f"Apparel exception check failed (bridge): {ex}")
+            return False
+
     try:
         async with httpx.AsyncClient(timeout=20.0) as client:
             response = await client.post(
@@ -504,6 +546,13 @@ async def _check_image_safety_moderation(image_bytes: bytes, content_type: str, 
             cats = result.get("categories", {})
             scores = result.get("category_scores", {})
             triggered = [k for k, v in cats.items() if v]
+            triggered_set = {str(k).lower() for k in triggered}
+
+            if triggered_set == {"sexual"}:
+                if await _is_allowed_apparel_exception_data_uri(data_uri):
+                    logger.info("✅ Apparel exception applied in bridge moderation (sexual-only flag)")
+                    return {"safe": True, "blocked_reason": None}
+
             # En yüksek skoru bul
             max_score = max((scores.get(k, 0) for k in triggered), default=0) if triggered else 0
             blocked_reason = ", ".join(triggered) if triggered else "policy_violation"
