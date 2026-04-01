@@ -856,6 +856,91 @@ def format_listing_detail(listing: dict) -> str:
     return "\n".join(lines)
 
 
+def build_vision_intro(vision_analyses: List[dict]) -> str:
+    """Build user-facing image analysis summary shown before agent response."""
+    if not vision_analyses:
+        return ""
+
+    lines: List[str] = ["🖼️ Görsel Analizi:"]
+    found_any = False
+
+    for idx, analysis in enumerate(vision_analyses[:3], start=1):
+        if not isinstance(analysis, dict):
+            continue
+
+        product = str(analysis.get("product") or "").strip()
+        condition = str(analysis.get("condition") or "").strip()
+        features = analysis.get("features") if isinstance(analysis.get("features"), list) else []
+
+        if not (product or condition or features):
+            continue
+
+        found_any = True
+        item_parts: List[str] = []
+        if product:
+            item_parts.append(product)
+        if condition:
+            item_parts.append(condition)
+        if features:
+            cleaned = [str(f).strip() for f in features if str(f).strip()][:3]
+            if cleaned:
+                item_parts.append("Özellikler: " + ", ".join(cleaned))
+
+        lines.append(f"{idx}. " + " | ".join(item_parts))
+
+    if not found_any:
+        return ""
+
+    lines.append("\nBu görsele göre ilanı birlikte tamamlayalım.")
+    return "\n".join(lines)
+
+
+def build_structured_prefill_from_vision(vision_analyses: List[dict]) -> Dict[str, str]:
+    """Build structured listing prefill from vision analysis outputs."""
+    if not vision_analyses:
+        return {}
+
+    first = vision_analyses[0] if isinstance(vision_analyses[0], dict) else {}
+    product = str(first.get("product") or "").strip()
+    condition_raw = str(first.get("condition") or "").strip().lower()
+
+    condition = ""
+    if any(k in condition_raw for k in ["sıfır", "sifir", "yeni"]):
+        condition = "Sıfır"
+    elif any(k in condition_raw for k in ["çok iyi", "iyi", "az", "temiz", "kullanılmış", "kullanilmis"]):
+        condition = "Az Kullanılmış"
+    elif condition_raw:
+        condition = "2. El"
+
+    desc_parts: List[str] = []
+    for idx, analysis in enumerate(vision_analyses[:3], start=1):
+        if not isinstance(analysis, dict):
+            continue
+        p = str(analysis.get("product") or "").strip()
+        c = str(analysis.get("condition") or "").strip()
+        feats = analysis.get("features") if isinstance(analysis.get("features"), list) else []
+        features_text = ", ".join([str(f).strip() for f in feats if str(f).strip()][:4])
+
+        seg = []
+        if p:
+            seg.append(f"Görsel {idx}: {p}")
+        if c:
+            seg.append(f"Durum: {c}")
+        if features_text:
+            seg.append(f"Öne çıkan özellikler: {features_text}")
+        if seg:
+            desc_parts.append(". ".join(seg))
+
+    payload: Dict[str, str] = {}
+    if product:
+        payload["title"] = product
+    if condition:
+        payload["condition"] = condition
+    if desc_parts:
+        payload["description_start"] = "\n".join(desc_parts)
+    return payload
+
+
 def send_typing_indicator(phone_number: str, is_typing: bool) -> None:
     """
     Send typing indicator to WhatsApp user
@@ -1012,6 +1097,8 @@ async def whatsapp_webhook(
     # Fresh media list for each new media message (vision needs only current photo)
     media_paths: List[str] = []
     vision_analyses: List[dict] = []  # Store vision analysis results
+    vision_intro_for_user: str = ""
+    structured_prefill: Dict[str, str] = {}
     draft_listing_id: Optional[str] = None
 
     if has_media:
@@ -1076,6 +1163,10 @@ async def whatsapp_webhook(
             if vision_summary:
                 vision_note = f"[VISION_ANALYSIS]{vision_summary}"
                 add_to_conversation_history(phone_number, "assistant", vision_note)
+
+            # Deterministic user-facing intro (shown before assistant response)
+            vision_intro_for_user = build_vision_intro(vision_analyses)
+            structured_prefill = build_structured_prefill_from_vision(vision_analyses)
             
             media_note = f"[SYSTEM_MEDIA_NOTE] DRAFT_LISTING_ID={draft_listing_id} | MEDIA_PATHS={media_paths}"
             add_to_conversation_history(phone_number, "assistant", media_note)
@@ -1155,7 +1246,8 @@ async def whatsapp_webhook(
             conversation_history_for_backend,
             media_paths=payload_media_paths,
             media_type=first_media_type if payload_media_paths else None,
-            draft_listing_id=payload_draft_id
+            draft_listing_id=payload_draft_id,
+            prefill_listing_data=structured_prefill or None,
         )
         
         if not agent_response:
@@ -1168,6 +1260,9 @@ async def whatsapp_webhook(
         if search_cache_results:
             update_search_cache(phone_number, search_cache_results)
             logger.info(f"📦 Search cache captured with {len(search_cache_results)} results")
+
+        if vision_intro_for_user:
+            agent_response = f"{vision_intro_for_user}\n\n{agent_response}"
         
         # Stop typing indicator before sending response
         send_typing_indicator(phone_number, False)
@@ -1205,7 +1300,8 @@ async def call_agent_backend(
     conversation_history: List[dict],
     media_paths: Optional[List[str]] = None,
     media_type: Optional[str] = None,
-    draft_listing_id: Optional[str] = None
+    draft_listing_id: Optional[str] = None,
+    prefill_listing_data: Optional[Dict[str, str]] = None,
 ) -> str:
     """
     Call Edge Function (Traffic Controller) → Backend
@@ -1243,6 +1339,7 @@ async def call_agent_backend(
                 "media_paths": media_paths,
                 "media_type": media_type,
                 "draft_listing_id": draft_listing_id,
+                "prefill_listing_data": prefill_listing_data,
             }
             
             logger.info(f"📦 Payload: phone={user_id}, message_length={len(user_input)}, history_length={len(conversation_history)}")
