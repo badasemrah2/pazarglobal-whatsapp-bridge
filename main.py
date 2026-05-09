@@ -913,23 +913,24 @@ def build_structured_prefill_from_vision(vision_analyses: List[dict]) -> Dict[st
         condition = "2. El"
 
     desc_parts: List[str] = []
-    for idx, analysis in enumerate(vision_analyses[:3], start=1):
+    for analysis in vision_analyses[:3]:
         if not isinstance(analysis, dict):
             continue
         p = str(analysis.get("product") or "").strip()
-        c = str(analysis.get("condition") or "").strip()
         feats = analysis.get("features") if isinstance(analysis.get("features"), list) else []
         features_text = ", ".join([str(f).strip() for f in feats if str(f).strip()][:4])
 
         seg = []
         if p:
-            seg.append(f"Görsel {idx}: {p}")
-        if c:
-            seg.append(f"Durum: {c}")
+            seg.append(p.rstrip(" ."))
         if features_text:
-            seg.append(f"Öne çıkan özellikler: {features_text}")
+            seg.append(features_text.rstrip(" ."))
         if seg:
-            desc_parts.append(". ".join(seg))
+            segment = re.sub(r"\s+", " ", ". ".join(seg)).strip(" ,;:-")
+            if segment and segment[-1] not in ".!?":
+                segment += "."
+            if segment:
+                desc_parts.append(segment[0].upper() + segment[1:])
 
     payload: Dict[str, str] = {}
     if product:
@@ -1355,10 +1356,19 @@ async def call_agent_backend(
                     "apikey": SUPABASE_SERVICE_KEY or "",
                 }
             )
-            
-            result = response.json()
+
+            try:
+                result = response.json()
+            except Exception:
+                raw_body = response.text[:500]
+                logger.error(f"❌ Edge Function JSON parse failed: status={response.status_code}, body={raw_body}")
+                return "Sistemden geçersiz yanıt alındı. Lütfen tekrar deneyin."
+
             logger.info(f"📨 Edge Function response: status={response.status_code}")
-            logger.info(f"🔍 DEBUG USER_ID FLOW: Edge response contains user_id={result.get('user_id', 'NOT_PRESENT')}")
+            if result.get("user_id"):
+                logger.info(f"🔍 DEBUG USER_ID FLOW: Edge response contains user_id={result.get('user_id')}")
+            else:
+                logger.info("🔍 DEBUG USER_ID FLOW: Edge response has no user_id (expected for PIN-required or unauthenticated flows)")
             
             # Check if PIN required
             if result.get("require_pin"):
@@ -1373,14 +1383,18 @@ async def call_agent_backend(
             if response.status_code == 401:
                 logger.warning("❌ Invalid PIN")
                 return result.get("response", "❌ Hatalı PIN kodu")
+
+            if response.status_code >= 500:
+                logger.error(f"❌ Edge Function server error: status={response.status_code}")
+                return result.get("response", "Sistem hatası oluştu. Lütfen tekrar deneyin.")
             
             if not result.get("success"):
-                logger.error(f"⚠️ Edge Function returned success=false")
+                logger.warning(f"⚠️ Edge Function returned success=false (status={response.status_code})")
                 return result.get("response", "İşlem başarısız oldu. Lütfen tekrar deneyin.")
             
             response_text = result.get("response", "")
             if not response_text:
-                logger.error("⚠️ Empty response from Edge Function")
+                logger.warning("⚠️ Empty response from Edge Function")
                 return "Boş yanıt alındı. Lütfen tekrar deneyin."
             
             logger.info(f"✅ Response text: {response_text[:100]}...")
