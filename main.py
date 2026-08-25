@@ -41,6 +41,26 @@ SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
 SUPABASE_STORAGE_BUCKET = os.getenv("SUPABASE_STORAGE_BUCKET", "product-images")
 
+# Verbose request dumps (full phone numbers, message bodies, media URLs) are opt-in and
+# meant for short debugging windows only. A user choosing to show their phone ON A LISTING
+# is not consent to keep their message contents in infrastructure logs.
+WHATSAPP_DEBUG_LOGGING = os.getenv("WHATSAPP_DEBUG_LOGGING", "false").strip().lower() in ("1", "true", "yes")
+
+
+def mask_phone(value) -> str:
+    """Render a phone number as +9053****4278 for logs.
+
+    Keeps enough to correlate a support request with a log line, without storing the
+    full number in Railway/Twilio log retention.
+    """
+    raw = str(value or "").replace("whatsapp:", "").strip()
+    if not raw:
+        return "<yok>"
+    digits = "".join(ch for ch in raw if ch.isdigit())
+    if len(digits) <= 8:
+        return "*" * len(digits)
+    return f"{raw[:5]}****{digits[-4:]}"
+
 # Initialize Twilio client
 twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN) if TWILIO_ACCOUNT_SID else None
 
@@ -428,7 +448,7 @@ async def _log_image_safety_flag_bridge(
                 },
                 json=payload,
             )
-        logger.info(f"🚩 image_safety_flags kaydedildi: {flag_type} | phone={phone_number}")
+        logger.info(f"🚩 image_safety_flags kaydedildi: {flag_type} | phone={mask_phone(phone_number)}")
     except Exception as e:
         logger.error(f"❌ image_safety_flags loglama hatası (akış devam ediyor): {e}")
 
@@ -653,7 +673,7 @@ def get_conversation_history(phone_number: str) -> List[dict]:
     
     if redis_data and isinstance(redis_data, dict):
         messages = redis_data.get("messages", [])
-        logger.info(f"📚 Retrieved {len(messages)} messages from Redis for {phone_number}")
+        logger.info(f"📚 Retrieved {len(messages)} messages from Redis for {mask_phone(phone_number)}")
         return messages
     
     # Fallback to in-memory
@@ -662,7 +682,7 @@ def get_conversation_history(phone_number: str) -> List[dict]:
     
     session = conversation_store[phone_number]
     if datetime.now() - session["last_activity"] > timedelta(minutes=CONVERSATION_TIMEOUT_MINUTES):
-        logger.info(f"🕐 Conversation expired for {phone_number}, clearing history")
+        logger.info(f"🕐 Conversation expired for {mask_phone(phone_number)}, clearing history")
         del conversation_store[phone_number]
         return []
     
@@ -707,7 +727,7 @@ def add_to_conversation_history(phone_number: str, role: str, content: str):
     if len(conversation_store[phone_number]["messages"]) > 20:
         conversation_store[phone_number]["messages"] = conversation_store[phone_number]["messages"][-20:]
     
-    logger.info(f"💾 Conversation updated (Redis + memory) for {phone_number}: {len(redis_data['messages'])} messages")
+    logger.info(f"💾 Conversation updated (Redis + memory) for {mask_phone(phone_number)}: {len(redis_data['messages'])} messages")
 
 
 def update_search_cache(phone_number: str, results: List[dict]):
@@ -719,7 +739,7 @@ def update_search_cache(phone_number: str, results: List[dict]):
         "timestamp": datetime.now().isoformat()
     }
     conversation_store[phone_number]["last_activity"] = datetime.now()
-    logger.info(f"💾 Search cache stored for {phone_number}: {len(results)} results")
+    logger.info(f"💾 Search cache stored for {mask_phone(phone_number)}: {len(results)} results")
 
 
 def get_search_cache(phone_number: str) -> Optional[List[dict]]:
@@ -811,7 +831,7 @@ def clear_conversation_history(phone_number: str):
     """Clear conversation history for a phone number"""
     if phone_number in conversation_store:
         del conversation_store[phone_number]
-        logger.info(f"🗑️ Conversation history cleared for {phone_number}")
+        logger.info(f"🗑️ Conversation history cleared for {mask_phone(phone_number)}")
 
 
 def format_listing_detail(listing: dict) -> str:
@@ -958,7 +978,7 @@ def send_typing_indicator(phone_number: str, is_typing: bool) -> None:
         # Twilio doesn't have a direct "typing indicator" API for WhatsApp
         # However, we can send a read receipt which shows activity
         # Note: This is a best-effort feature; WhatsApp typing indicators are primarily client-side
-        logger.info(f"{'✍️ Starting' if is_typing else '⏸️ Stopping'} typing indicator for {phone_number}")
+        logger.info(f"{'✍️ Starting' if is_typing else '⏸️ Stopping'} typing indicator for {mask_phone(phone_number)}")
         
         # Alternative approach: Send empty message to trigger "online" status
         # This is disabled by default as it may send unwanted messages
@@ -1069,11 +1089,14 @@ async def whatsapp_webhook(
     media_keys = {k: v for k, v in form.items() if k.lower().startswith("media")}
     form_items = list(form.items())
 
-    logger.info(f"📱 Incoming WhatsApp message from {From}: {Body}")
-    logger.info(f"🔍 DEBUG - NumMedia: {num_media}, MediaUrl0: {MediaUrl0}, MediaContentType0: {MediaContentType0}")
-    logger.info(f"🔍 DEBUG - MessageSid: {MessageSid}")
-    logger.info(f"🧾 FORM MEDIA KEYS: {media_keys}")
-    logger.info(f"🧾 FORM ITEMS (first 30): {form_items[:30]}")
+    logger.info(
+        f"📱 Incoming WhatsApp message from {mask_phone(From)} "
+        f"(len={len(Body or '')}, media={num_media}, sid={MessageSid})"
+    )
+    if WHATSAPP_DEBUG_LOGGING:
+        logger.info(f"🔍 DEBUG - MediaUrl0: {MediaUrl0}, MediaContentType0: {MediaContentType0}")
+        logger.info(f"🧾 FORM MEDIA KEYS: {media_keys}")
+        logger.info(f"🧾 FORM ITEMS (first 30): {form_items[:30]}")
 
     # Extract phone number early for history reuse
     phone_number = From.replace('whatsapp:', '')
@@ -1221,7 +1244,7 @@ async def whatsapp_webhook(
 
         # Get conversation history (previous messages only, NOT current message)
         conversation_history = get_conversation_history(phone_number)
-        logger.info(f"📚 Conversation history for {phone_number}: {len(conversation_history)} messages")
+        logger.info(f"📚 Conversation history for {mask_phone(phone_number)}: {len(conversation_history)} messages")
 
         # If this is a numbered-detail request, inject last search results note so backend can resolve
         # listing id deterministically even across multiple backend instances.
@@ -1254,7 +1277,7 @@ async def whatsapp_webhook(
         if not agent_response:
             raise HTTPException(status_code=500, detail="No response from Agent Backend")
         
-        logger.info(f"✅ Agent response: {agent_response[:100]}...")
+        logger.info(f"✅ Agent response received (len={len(agent_response)})")
 
         # Extract and store search cache (if present), and strip it from user-facing text
         agent_response, search_cache_results = parse_search_cache_block(agent_response)
@@ -1343,8 +1366,8 @@ async def call_agent_backend(
                 "prefill_listing_data": prefill_listing_data,
             }
             
-            logger.info(f"📦 Payload: phone={user_id}, message_length={len(user_input)}, history_length={len(conversation_history)}")
-            logger.info(f"🔍 DEBUG USER_ID FLOW: WhatsApp Bridge sending phone={user_id} to Edge Function")
+            logger.info(f"📦 Payload: phone={mask_phone(user_id)}, message_length={len(user_input)}, history_length={len(conversation_history)}")
+            logger.info(f"🔍 DEBUG USER_ID FLOW: WhatsApp Bridge sending phone={mask_phone(user_id)} to Edge Function")
             
             response = await client.post(
                 EDGE_FUNCTION_URL,
@@ -1397,7 +1420,7 @@ async def call_agent_backend(
                 logger.warning("⚠️ Empty response from Edge Function")
                 return "Boş yanıt alındı. Lütfen tekrar deneyin."
             
-            logger.info(f"✅ Response text: {response_text[:100]}...")
+            logger.info(f"✅ Response text received (len={len(response_text)})")
             return response_text
             
     except httpx.HTTPStatusError as e:
