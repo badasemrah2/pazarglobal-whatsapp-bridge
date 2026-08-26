@@ -239,6 +239,90 @@ def test_media_only_message_keeps_empty_body():
     assert body == "", repr(body)
 
 
+# ── Long replies are split, not cut off ──────────────────────────────────────
+
+def _search_reply(count: int) -> str:
+    """A search result shaped the way search_agents builds one."""
+    desc = "Temiz, bakımlı, hasar kaydı yok. Antep teslim. Detaylı bilgi için mesaj atabilirsiniz."
+    blocks = [
+        f"{i}. 20{10 + i} Marka Model {i}.6 Dizel Paket, {300 + i}.000 km - "
+        f"{400 + i * 25}.000 TL - Otomotiv\n{desc}\n"
+        f"Mesaj Gönder: https://pazarglobal.com/contact/a1b2c3d4e5f6g7h8i9j{i}"
+        for i in range(1, count + 1)
+    ]
+    return (
+        f"Aramanıza uygun {count} ilan buldum:\n\n"
+        + "\n\n".join(blocks)
+        + "\n\nDetay için: '1 nolu ilanın detayını göster' yazabilirsiniz."
+    )
+
+
+def test_short_reply_stays_one_message():
+    from main import _split_for_whatsapp
+
+    parts, dropped = _split_for_whatsapp("Merhaba, nasıl yardımcı olabilirim?", 1130, 3)
+    assert parts == ["Merhaba, nasıl yardımcı olabilirim?"]
+    assert dropped == 0
+
+
+def test_long_search_reply_keeps_every_listing():
+    """The whole point: five listings found must be five listings delivered."""
+    import re
+    from main import _split_for_whatsapp
+
+    body = _search_reply(5)
+    limit = 1130
+    assert len(body) > limit, "fixture must actually exceed one message"
+
+    parts, dropped = _split_for_whatsapp(body, limit, 3)
+
+    assert dropped == 0
+    assert len(parts) > 1
+    assert all(len(p) <= limit for p in parts), [len(p) for p in parts]
+
+    found = sum(len(re.findall(r"^\d+\. 20", p, re.MULTILINE)) for p in parts)
+    assert found == 5, f"lost listings: {found} of 5"
+
+
+def test_split_falls_on_listing_boundaries():
+    """A message must never begin in the middle of a listing."""
+    from main import _split_for_whatsapp
+
+    parts, _ = _split_for_whatsapp(_search_reply(6), 1130, 3)
+    for part in parts[1:]:
+        assert not part.lstrip().startswith("Mesaj Gönder"), part[:60]
+        assert not part.lstrip().startswith("Temiz, bakımlı"), part[:60]
+
+
+def test_oversized_single_block_falls_back_to_lines():
+    """One listing longer than a whole message still has to go out."""
+    from main import _split_for_whatsapp
+
+    block = "\n".join(f"satır {i} " + "x" * 60 for i in range(40))
+    parts, dropped = _split_for_whatsapp(block, 300, 10)
+
+    assert len(parts) > 1
+    assert all(len(p) <= 300 for p in parts), [len(p) for p in parts]
+    assert dropped == 0
+
+
+def test_exceeding_the_part_cap_reports_what_was_dropped():
+    """A cap that truncates silently reads as "that was everything"."""
+    from main import _split_for_whatsapp
+
+    parts, dropped = _split_for_whatsapp(_search_reply(30), 600, 2)
+
+    assert len(parts) == 2
+    assert dropped > 0, "dropped content must be reported, not swallowed"
+
+
+def test_empty_reply_produces_no_parts():
+    from main import _split_for_whatsapp
+
+    assert _split_for_whatsapp("", 1130, 3) == ([], 0)
+    assert _split_for_whatsapp("   \n  ", 1130, 3) == ([], 0)
+
+
 # ── Log routing ──────────────────────────────────────────────────────────────
 
 def test_routine_logs_go_to_stdout_and_problems_to_stderr():

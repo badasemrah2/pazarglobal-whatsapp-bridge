@@ -139,6 +139,11 @@ CONVERSATION_TIMEOUT_MINUTES = 30  # Clear conversations after 30 minutes of ina
 MAX_MEDIA_BYTES = 10 * 1024 * 1024  # 10 MB limit
 MAX_MEDIA_PER_MESSAGE = 3  # Avoid WhatsApp bulk; keep under total size limits
 
+# A reply longer than one WhatsApp message is split across this many rather than being
+# cut off. Three carries a full page of search results; beyond that the seller is better
+# served by narrowing the search than by more messages, and the last part says so.
+MAX_WHATSAPP_PARTS = int(os.getenv("WHATSAPP_MAX_PARTS", "3"))
+
 # If true, WhatsApp bridge will render numbered listing detail from its in-memory cache
 # without calling backend. Default is False to keep WhatsApp/WebChat behavior consistent.
 WHATSAPP_LOCAL_DETAIL_SHORTCIRCUIT = os.getenv("WHATSAPP_LOCAL_DETAIL_SHORTCIRCUIT", "false").lower() in ("1", "true", "yes")
@@ -1117,6 +1122,56 @@ def send_typing_indicator(phone_number: str, is_typing: bool) -> None:
         logger.warning(f"⚠️ Failed to send typing indicator: {e}")
 
 
+def _split_for_whatsapp(text: str, limit: int, max_parts: int) -> tuple[List[str], int]:
+    """Break a long reply into WhatsApp-sized messages. Returns (parts, dropped_chars).
+
+    Splitting happens on blank lines first, which is where one listing ends and the next
+    begins in a search result, so a message is never cut through the middle of a listing.
+    A single block longer than the limit falls back to line boundaries, then to a hard cut.
+    """
+    text = (text or "").strip()
+    if not text:
+        return [], 0
+    if len(text) <= limit:
+        return [text], 0
+
+    parts: List[str] = []
+    current = ""
+
+    for block in re.split(r"\n\s*\n", text):
+        block = block.strip()
+        if not block:
+            continue
+
+        candidate = f"{current}\n\n{block}" if current else block
+        if len(candidate) <= limit:
+            current = candidate
+            continue
+
+        if current:
+            parts.append(current)
+            current = ""
+
+        # One listing on its own longer than a whole message: fall back to lines.
+        while len(block) > limit:
+            cut = block.rfind("\n", 0, limit)
+            if cut <= 0:
+                cut = limit
+            parts.append(block[:cut].strip())
+            block = block[cut:].strip()
+        current = block
+
+    if current:
+        parts.append(current)
+
+    dropped = 0
+    if len(parts) > max_parts:
+        dropped = sum(len(p) for p in parts[max_parts:])
+        parts = parts[:max_parts]
+
+    return parts, dropped
+
+
 def send_twilio_message(phone_number: str, body_text: str) -> bool:
     """Send WhatsApp message via Twilio with length and media safeguards."""
     if not twilio_client:
@@ -1140,39 +1195,63 @@ def send_twilio_message(phone_number: str, body_text: str) -> bool:
     if not cleaned_body and media_urls:
         cleaned_body = "Sonuçlar görseller olarak gönderildi. Daha spesifik arama yapabilirsiniz."
 
-    truncated_response = cleaned_body
-    if len(cleaned_body) > MAX_BODY_LENGTH:
-        logger.warning(
-            f"⚠️ Response too long ({len(cleaned_body)} chars), truncating to {MAX_BODY_LENGTH} (with {len(media_urls)} media)"
-        )
-        truncated_response = cleaned_body[:MAX_BODY_LENGTH - 60] + "\n\n...(devamı için daha spesifik arama yapın)"
+    # A search that found five listings used to arrive with two of them and the line
+    # "devamı için daha spesifik arama yapın" - advice that made no sense, because the
+    # listings had been found and simply did not fit. Long replies are split across
+    # messages on listing boundaries instead of being cut off.
+    #
+    # The limit is reduced by the "(1/3)" prefix so numbered parts still fit.
+    parts, dropped = _split_for_whatsapp(cleaned_body, MAX_BODY_LENGTH - 10, MAX_WHATSAPP_PARTS)
+    if not parts:
+        parts = [cleaned_body or ""]
 
-    try:
-        message = twilio_client.messages.create(
-            from_=_normalize_whatsapp_number(TWILIO_WHATSAPP_NUMBER),
-            body=truncated_response,
-            media_url=media_urls if media_urls else None,
-            to=_normalize_whatsapp_number(phone_number)
+    if dropped:
+        # Never let a cap be silent about what it removed.
+        logger.warning(
+            f"⚠️ Reply needed more than {MAX_WHATSAPP_PARTS} messages; "
+            f"{dropped} chars not sent"
         )
-        logger.info(f"✅ Twilio message sent: {message.sid}")
-        return True
-    except Exception as e:
-        logger.error(f"❌ Twilio send error: {e}")
-        # Retry without media if media_urls caused the error
-        if media_urls:
-            logger.warning("🔄 Retrying without media...")
-            try:
-                message = twilio_client.messages.create(
-                    from_=f'whatsapp:{TWILIO_WHATSAPP_NUMBER}',
-                    body=truncated_response,
-                    to=f'whatsapp:{phone_number}'
-                )
-                logger.info(f"✅ Message sent without media: {message.sid}")
-                return True
-            except Exception as retry_error:
-                logger.error(f"❌ Retry also failed: {retry_error}")
-                return False
-        return False
+        parts[-1] = f"{parts[-1]}\n\n…daha fazla sonuç var, aramanı daraltabilirsin."
+
+    if len(parts) > 1:
+        logger.info(f"✉️ Reply split into {len(parts)} messages ({len(cleaned_body)} chars)")
+        total = len(parts)
+        parts = [f"({i}/{total}) {p}" for i, p in enumerate(parts, 1)]
+
+    def _send(body: str, with_media: bool) -> bool:
+        try:
+            message = twilio_client.messages.create(
+                from_=_normalize_whatsapp_number(TWILIO_WHATSAPP_NUMBER),
+                body=body,
+                media_url=media_urls if (with_media and media_urls) else None,
+                to=_normalize_whatsapp_number(phone_number),
+            )
+            logger.info(f"✅ Twilio message sent: {message.sid}")
+            return True
+        except Exception as e:
+            logger.error(f"❌ Twilio send error: {e}")
+            # Retry without media if media_urls caused the error
+            if with_media and media_urls:
+                logger.warning("🔄 Retrying without media...")
+                try:
+                    message = twilio_client.messages.create(
+                        from_=_normalize_whatsapp_number(TWILIO_WHATSAPP_NUMBER),
+                        body=body,
+                        to=_normalize_whatsapp_number(phone_number),
+                    )
+                    logger.info(f"✅ Message sent without media: {message.sid}")
+                    return True
+                except Exception as retry_error:
+                    logger.error(f"❌ Retry also failed: {retry_error}")
+            return False
+
+    # The photos ride with the first message; the rest are text follow-ups. Success is
+    # reported on the first part: if it went out the seller has an answer, and a failed
+    # follow-up is already logged above.
+    sent_first = _send(parts[0], with_media=True)
+    for part in parts[1:]:
+        _send(part, with_media=False)
+    return sent_first
 # ================================================
 
 
