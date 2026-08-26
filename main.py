@@ -17,13 +17,67 @@ import httpx
 from twilio.rest import Client
 from twilio.twiml.messaging_response import MessagingResponse
 import logging
+import sys
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 from PIL import Image
-from redis_helper import redis_client  # Redis client for persistent storage
 
-# Setup logging
-logging.basicConfig(level=logging.INFO)
+# Verbose request dumps (full phone numbers, message bodies, media URLs) are opt-in and
+# meant for short debugging windows only. A user choosing to show their phone ON A LISTING
+# is not consent to keep their message contents in infrastructure logs.
+WHATSAPP_DEBUG_LOGGING = os.getenv("WHATSAPP_DEBUG_LOGGING", "false").strip().lower() in ("1", "true", "yes")
+
+
+def _configure_logging() -> None:
+    """Route routine logs to stdout and only real problems to stderr.
+
+    logging.basicConfig() writes to stderr when given no stream, and Railway reads
+    anything on stderr as an error. So every ordinary INFO line this bridge produced -
+    "Incoming WhatsApp message", "Media uploaded successfully" - arrived tagged
+    severity:"error". The service looked like it was failing continuously and a genuine
+    failure had nothing to stand out against: the four bugs in the 26 Aug Jetta run all
+    had to be dug out of a wall of false errors.
+
+    Splitting the streams makes severity:"error" in Railway mean what it says.
+    """
+    level = logging.DEBUG if WHATSAPP_DEBUG_LOGGING else logging.INFO
+    fmt = logging.Formatter("%(levelname)s:%(name)s:%(message)s")
+
+    stdout_handler = logging.StreamHandler(sys.stdout)
+    stdout_handler.setFormatter(fmt)
+    stdout_handler.setLevel(level)
+    # Warnings and errors are handled by the stderr handler below. Without this filter
+    # every one of them would be printed on both streams.
+    stdout_handler.addFilter(lambda record: record.levelno < logging.WARNING)
+
+    stderr_handler = logging.StreamHandler(sys.stderr)
+    stderr_handler.setFormatter(fmt)
+    stderr_handler.setLevel(logging.WARNING)
+
+    root = logging.getLogger()
+    root.handlers.clear()
+    root.setLevel(level)
+    root.addHandler(stdout_handler)
+    root.addHandler(stderr_handler)
+
+    # The Twilio client logs a full request and response header dump at INFO - about a
+    # dozen lines for every message sent, none of which say anything our own logs do not.
+    # httpx logs a line per request; the media download already reports its own status.
+    # WHATSAPP_DEBUG_LOGGING brings both back for a debugging window.
+    if not WHATSAPP_DEBUG_LOGGING:
+        logging.getLogger("twilio.http_client").setLevel(logging.WARNING)
+        logging.getLogger("httpx").setLevel(logging.WARNING)
+
+
+# Configured before redis_helper is imported: that module reports whether Redis actually
+# connected as it loads, and whether it did decides whether the album debounce and the
+# draft claim work at all. Left until after the import, the line fell to logging's
+# last-resort handler, which is unformatted and drops INFO entirely - so a healthy
+# "Redis connected" was never printed and its absence meant nothing.
+_configure_logging()
+
+from redis_helper import redis_client  # noqa: E402  (see _configure_logging above)
+
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Pazarglobal WhatsApp Bridge")
@@ -43,10 +97,7 @@ SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
 SUPABASE_STORAGE_BUCKET = os.getenv("SUPABASE_STORAGE_BUCKET", "product-images")
 
-# Verbose request dumps (full phone numbers, message bodies, media URLs) are opt-in and
-# meant for short debugging windows only. A user choosing to show their phone ON A LISTING
-# is not consent to keep their message contents in infrastructure logs.
-WHATSAPP_DEBUG_LOGGING = os.getenv("WHATSAPP_DEBUG_LOGGING", "false").strip().lower() in ("1", "true", "yes")
+# WHATSAPP_DEBUG_LOGGING is defined near the top, next to _configure_logging().
 
 # How long a media webhook waits to see whether more photos of the same album follow.
 #

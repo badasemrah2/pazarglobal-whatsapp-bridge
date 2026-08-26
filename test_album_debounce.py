@@ -9,6 +9,11 @@ Run: python test_album_debounce.py
 """
 import sys
 
+# main is imported first on purpose: it configures logging before pulling in
+# redis_helper, which reports its connection state as it loads. Importing redis_helper
+# first would reproduce the pre-fix ordering, where that line fell to logging's
+# unformatted last-resort handler.
+import main  # noqa: F401
 import redis_helper
 from redis_helper import redis_client
 
@@ -232,6 +237,56 @@ def test_media_only_message_keeps_empty_body():
 
     _, _, body = album_collect(draft, [], [], "")
     assert body == "", repr(body)
+
+
+# ── Log routing ──────────────────────────────────────────────────────────────
+
+def test_routine_logs_go_to_stdout_and_problems_to_stderr():
+    """Railway reads stderr as an error, so ordinary INFO must not land there.
+
+    logging.basicConfig() defaults to stderr, which tagged every "Incoming WhatsApp
+    message" as severity:"error" and left real failures with nothing to stand out
+    against. This asserts the split rather than the config, so reintroducing
+    basicConfig() anywhere would fail it.
+    """
+    import io as _io
+    import logging
+    import main  # noqa: F401  (importing configures logging)
+
+    root = logging.getLogger()
+    streams = {}
+    for handler in root.handlers:
+        buf = _io.StringIO()
+        handler.stream = buf
+        streams[handler] = buf
+
+    log = logging.getLogger("main")
+    log.info("routine line")
+    log.warning("needs attention")
+    log.error("broken")
+
+    out = "".join(
+        b.getvalue() for h, b in streams.items() if h.level < logging.WARNING
+    )
+    err = "".join(
+        b.getvalue() for h, b in streams.items() if h.level >= logging.WARNING
+    )
+
+    assert "routine line" in out, out
+    assert "routine line" not in err, err
+    assert "needs attention" in err, err
+    assert "broken" in err, err
+    # A record printed on both streams would show up twice in Railway.
+    assert "needs attention" not in out, out
+
+
+def test_twilio_header_dumps_are_silenced_by_default():
+    """A dozen header lines per sent message, saying nothing our own logs do not."""
+    import logging
+    import main  # noqa: F401
+
+    assert logging.getLogger("twilio.http_client").level >= logging.WARNING
+    assert logging.getLogger("httpx").level >= logging.WARNING
 
 
 def run():
