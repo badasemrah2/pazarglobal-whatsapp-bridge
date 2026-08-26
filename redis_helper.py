@@ -61,6 +61,29 @@ class SimpleRedisClient:
             logger.error(f"Redis get error: {e}")
             return _IN_MEMORY_STORE.get(key)
     
+    def get_or_set(self, key: str, value: str, ttl: int = 1800) -> str:
+        """Atomically claim `key` for `value`; return whatever ended up stored.
+
+        WhatsApp delivers each photo of an album as its own webhook, and they arrive
+        concurrently. A read-then-write would let every one of them believe it was first,
+        which is exactly how a four-photo car ended up as four separate drafts. SET NX
+        makes the first writer win and hands everyone else the same id.
+        """
+        try:
+            if self._enabled:
+                # nx=True only sets when absent; returns None when the key already exists.
+                if self._client.set(key, value, nx=True, ex=ttl):
+                    return value
+                existing = self._client.get(key)
+                return existing if existing else value
+
+            if key not in _IN_MEMORY_STORE:
+                _IN_MEMORY_STORE[key] = value
+            return _IN_MEMORY_STORE[key]
+        except Exception as e:
+            logger.error(f"Redis get_or_set error: {e}")
+            return value
+
     def delete(self, key: str) -> bool:
         """Delete key"""
         try:

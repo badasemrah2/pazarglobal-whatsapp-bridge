@@ -1127,12 +1127,25 @@ async def whatsapp_webhook(
 
     if has_media:
         logger.info(f"📸 Media attached count: {len(media_items)}")
-        if prev_draft_id:
-            draft_listing_id = prev_draft_id
+        # The draft id used to be recovered by parsing it back out of a chat-history
+        # string, which is written only after a photo finishes uploading. WhatsApp sends
+        # each photo of an album as its own concurrent webhook, so every photo read the
+        # history before any of them had written to it, decided no draft existed, and
+        # minted its own. A four-photo car became four separate listings.
+        #
+        # The id now lives in its own atomically-claimed key: the first photo creates it,
+        # the rest get handed the same one no matter how they interleave. History parsing
+        # stays as a fallback for the pre-existing drafts already recorded that way.
+        claim_key = f"active_draft:{phone_number}"
+        candidate = prev_draft_id or str(uuid.uuid4())
+        draft_listing_id = redis_client.get_or_set(claim_key, candidate, ttl=1800)
+
+        if draft_listing_id == prev_draft_id:
             logger.info(f"📋 Reusing draft listing ID: {draft_listing_id}")
-        else:
-            draft_listing_id = str(uuid.uuid4())
+        elif draft_listing_id == candidate:
             logger.info(f"📋 New draft listing ID: {draft_listing_id}")
+        else:
+            logger.info(f"📋 Joined concurrent draft listing ID: {draft_listing_id}")
         uploaded_any = False
         blocked_any = False
         blocked_reason_msg = ""
