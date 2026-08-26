@@ -85,6 +85,52 @@ def test_blocked_last_photo_lets_the_album_still_answer():
     assert [t for t in good if t == final] == [3], f"photo 3 should answer, final={final}"
 
 
+def test_failed_photo_keeps_its_ticket():
+    """A photo that fails to download must still be able to answer for the album.
+
+    It holds no photos of its own, but its siblings' are in the pile - and if it gave the
+    ticket back, an album where every photo failed would release every ticket and leave
+    nobody to reply at all.
+    """
+    reset_store()
+    key = "album_seq:+905551112233"
+    draft = "draft-allfail"
+    from main import album_collect
+
+    tickets = [redis_client.counter(key) for _ in range(3)]
+    for _ in tickets:
+        redis_client.counter(f"album_failed:{draft}")
+
+    final = redis_client.counter_value(key)
+    assert [t for t in tickets if t == final] == [3], "photo 3 must still answer"
+    assert redis_client.counter_value(f"album_failed:{draft}") == 3
+
+    # Nothing was gathered, so the survivor keeps the text it already has.
+    paths, _, body = album_collect(draft, [], [], "2011 model Jetta")
+    assert paths == []
+    assert body == "2011 model Jetta"
+
+
+def test_survivor_answers_with_siblings_photos_when_its_own_failed():
+    """One photo 404s at Twilio; the reply still carries the three that arrived."""
+    reset_store()
+    draft = "draft-partial"
+    from main import album_contribute, album_collect
+
+    album_contribute(draft, ["p/1.jpg"], [{"product": "Jetta"}], "2011 model Jetta")
+    album_contribute(draft, ["p/2.jpg"], [{"product": "Jetta arka"}], "")
+    album_contribute(draft, ["p/3.jpg"], [{"product": "Jetta iç"}], "")
+    redis_client.counter(f"album_failed:{draft}")  # the fourth never downloaded
+
+    # The failed webhook is last, so it answers - with nothing of its own to add.
+    paths, vision, body = album_collect(draft, [], [], "")
+
+    assert paths == ["p/1.jpg", "p/2.jpg", "p/3.jpg"], paths
+    assert len(vision) == 3
+    assert body == "2011 model Jetta"
+    assert redis_client.counter_value(f"album_failed:{draft}") == 1
+
+
 def test_every_photo_blocked_leaves_no_survivor():
     """Nothing uploaded means nothing to summarise; only the block messages go out."""
     reset_store()

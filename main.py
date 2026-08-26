@@ -56,6 +56,12 @@ WHATSAPP_DEBUG_LOGGING = os.getenv("WHATSAPP_DEBUG_LOGGING", "false").strip().lo
 # before the agent call, not instead of it.
 MEDIA_DEBOUNCE_SECONDS = float(os.getenv("WHATSAPP_MEDIA_DEBOUNCE_SECONDS", "3"))
 
+# Twilio can announce a photo before the media is fetchable. These retries only run on a
+# 404 - the case where the photo would otherwise be lost - so they cost nothing on the
+# normal path and the seconds they spend count towards the debounce window above.
+_MEDIA_FETCH_ATTEMPTS = 3
+_MEDIA_FETCH_BACKOFF = (1.0, 2.0)
+
 
 def mask_phone(value) -> str:
     """Render a phone number as +9053****4278 for logs.
@@ -181,29 +187,44 @@ async def download_media(media_url: str, media_type: Optional[str], message_sid:
         return None
     try:
         logger.info(f"📥 Downloading media from: {media_url[:80]}...")
-        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
-            resp = await client.get(media_url, auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN))
-        
-        logger.info(f"📊 Download response: status={resp.status_code}, content-type={resp.headers.get('Content-Type')}")
-        
-        if resp.status_code == 404 and twilio_client and message_sid and media_sid:
-            logger.warning(f"⚠️ Direct URL returned 404, trying Twilio API fallback...")
-            try:
-                media_obj = twilio_client.messages(message_sid).media(media_sid).fetch()
-                # Twilio returns uri like /2010-04-01/Accounts/AC.../Messages/MM.../Media/ME....json
-                if media_obj.uri:
-                    fallback_url = f"https://api.twilio.com{media_obj.uri.replace('.json','')}"
-                else:
-                    raise ValueError("Media object has no URI")
-                logger.info(f"🔄 Fallback URL: {fallback_url}")
-                async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
-                    resp = await client.get(fallback_url, auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN))
-                logger.info(f"📊 Fallback response: status={resp.status_code}")
-            except Exception as tw_err:
-                logger.error(f"❌ Twilio fallback media fetch failed: {tw_err}")
-                return None
 
-        if not resp.is_success:
+        # A 404 here usually means "not yet", not "never". Twilio announces a photo in the
+        # webhook slightly before the media itself is retrievable, so one photo of an
+        # album can 404 on both the direct URL and the API record while its siblings
+        # download fine - and it was then dropped silently, leaving the seller with a
+        # listing missing a picture they had sent. Waiting a moment and asking again is
+        # what actually fixes it.
+        resp = None
+        for attempt in range(_MEDIA_FETCH_ATTEMPTS):
+            if attempt:
+                await asyncio.sleep(_MEDIA_FETCH_BACKOFF[min(attempt - 1, len(_MEDIA_FETCH_BACKOFF) - 1)])
+                logger.info(f"🔁 Retrying media fetch (attempt {attempt + 1}/{_MEDIA_FETCH_ATTEMPTS})")
+
+            async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+                resp = await client.get(media_url, auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN))
+
+            logger.info(f"📊 Download response: status={resp.status_code}, content-type={resp.headers.get('Content-Type')}")
+
+            if resp.status_code == 404 and twilio_client and message_sid and media_sid:
+                logger.warning(f"⚠️ Direct URL returned 404, trying Twilio API fallback...")
+                try:
+                    media_obj = twilio_client.messages(message_sid).media(media_sid).fetch()
+                    # Twilio returns uri like /2010-04-01/Accounts/AC.../Messages/MM.../Media/ME....json
+                    if media_obj.uri:
+                        fallback_url = f"https://api.twilio.com{media_obj.uri.replace('.json','')}"
+                    else:
+                        raise ValueError("Media object has no URI")
+                    logger.info(f"🔄 Fallback URL: {fallback_url}")
+                    async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+                        resp = await client.get(fallback_url, auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN))
+                    logger.info(f"📊 Fallback response: status={resp.status_code}")
+                except Exception as tw_err:
+                    logger.warning(f"⚠️ Twilio fallback media fetch failed: {tw_err}")
+
+            if resp.status_code != 404:
+                break
+
+        if resp is None or not resp.is_success:
             logger.error(f"❌ Failed to download media: status={resp.status_code}, body={resp.text[:200]}")
             return None
         
@@ -1176,6 +1197,7 @@ async def whatsapp_webhook(
     media_paths: List[str] = []
     vision_analyses: List[dict] = []  # Store vision analysis results
     vision_intro_for_user: str = ""
+    album_warning: str = ""
     structured_prefill: Dict[str, str] = {}
     draft_listing_id: Optional[str] = None
 
@@ -1258,8 +1280,17 @@ async def whatsapp_webhook(
             # and the agent would read them as four separate things being sold.
             album_contribute(draft_listing_id, media_paths, vision_analyses, Body)
         else:
+            # This webhook's photo did not make it even after the retries. It keeps its
+            # ticket: if it turns out to be the last one it still answers, using the
+            # photos its siblings put in the pile. Handing the ticket back here would
+            # mean an album where every photo failed released every ticket and nobody
+            # was left to reply at all.
+            #
+            # The loss is recorded so whichever webhook does answer can say a photo went
+            # missing - dropping one silently left the seller with a listing short a
+            # picture they had sent, and no idea why.
             logger.warning("Media processing failed; continuing without attachment")
-            # Optional: notify user about media failure
+            redis_client.counter(f"album_failed:{draft_listing_id}", ttl=1800)
 
     # ── Album debounce ────────────────────────────────────────────────────────
     # WhatsApp delivers each photo of an album as its own webhook, so a four-photo car
@@ -1290,6 +1321,17 @@ async def whatsapp_webhook(
         media_paths, vision_analyses, Body = album_collect(
             draft_listing_id, media_paths, vision_analyses, Body
         )
+
+        lost = redis_client.counter_value(f"album_failed:{draft_listing_id}")
+        if lost:
+            redis_client.delete(f"album_failed:{draft_listing_id}")
+            album_warning = (
+                f"⚠️ {lost} fotoğraf yüklenemedi, tekrar gönderebilirsin.\n\n"
+                if lost > 1
+                else "⚠️ Bir fotoğraf yüklenemedi, tekrar gönderebilirsin.\n\n"
+            )
+            logger.warning(f"🖼️ Album lost {lost} photo(s); telling the seller")
+
         logger.info(
             f"🖼️ Album complete: {len(media_paths)} photo(s), "
             f"{len(vision_analyses)} analysis(es), text={len(Body or '')} chars"
@@ -1413,7 +1455,11 @@ async def whatsapp_webhook(
 
         if vision_intro_for_user:
             agent_response = f"{vision_intro_for_user}\n\n{agent_response}"
-        
+
+        # A photo that never arrived is the seller's to know about, so this leads.
+        if album_warning:
+            agent_response = f"{album_warning}{agent_response}"
+
         # Stop typing indicator before sending response
         send_typing_indicator(phone_number, False)
         
