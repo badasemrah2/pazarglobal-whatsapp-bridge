@@ -3,11 +3,13 @@ Pazarglobal WhatsApp Bridge
 FastAPI webhook server to bridge WhatsApp (Twilio) with Agent Backend (OpenAI Agents SDK)
 Replaces N8N workflow
 """
+import asyncio
 import ast
 import io
 import json
 import os
 import uuid
+import time
 import re
 from fastapi import FastAPI, Request, HTTPException, Form
 from fastapi.responses import Response
@@ -46,6 +48,14 @@ SUPABASE_STORAGE_BUCKET = os.getenv("SUPABASE_STORAGE_BUCKET", "product-images")
 # is not consent to keep their message contents in infrastructure logs.
 WHATSAPP_DEBUG_LOGGING = os.getenv("WHATSAPP_DEBUG_LOGGING", "false").strip().lower() in ("1", "true", "yes")
 
+# How long a media webhook waits to see whether more photos of the same album follow.
+#
+# WhatsApp sends one webhook per photo, so a four-photo car used to get four replies. Each
+# webhook takes a ticket, waits this long, and only the last one still holding the highest
+# ticket answers. Keep it well under Twilio's 15s webhook timeout: this delay is spent
+# before the agent call, not instead of it.
+MEDIA_DEBOUNCE_SECONDS = float(os.getenv("WHATSAPP_MEDIA_DEBOUNCE_SECONDS", "3"))
+
 
 def mask_phone(value) -> str:
     """Render a phone number as +9053****4278 for logs.
@@ -75,6 +85,50 @@ MAX_MEDIA_PER_MESSAGE = 3  # Avoid WhatsApp bulk; keep under total size limits
 # If true, WhatsApp bridge will render numbered listing detail from its in-memory cache
 # without calling backend. Default is False to keep WhatsApp/WebChat behavior consistent.
 WHATSAPP_LOCAL_DETAIL_SHORTCIRCUIT = os.getenv("WHATSAPP_LOCAL_DETAIL_SHORTCIRCUIT", "false").lower() in ("1", "true", "yes")
+
+
+def album_contribute(
+    draft_listing_id: str,
+    media_paths: List[str],
+    vision_analyses: List[dict],
+    body: str,
+) -> None:
+    """Add one webhook's share of an album to the pile the surviving webhook will read."""
+    for path in media_paths:
+        redis_client.list_append(f"album_paths:{draft_listing_id}", path)
+    for analysis in vision_analyses:
+        redis_client.list_append(f"album_vision:{draft_listing_id}", analysis)
+    if (body or "").strip():
+        redis_client.list_append(f"album_text:{draft_listing_id}", body.strip())
+
+
+def album_collect(
+    draft_listing_id: str,
+    media_paths: List[str],
+    vision_analyses: List[dict],
+    body: str,
+) -> tuple[List[str], List[dict], str]:
+    """Drain the album and return everything its webhooks gathered.
+
+    Falls back to the caller's own values for anything the pile does not have, so a
+    single-photo message or a Redis outage still goes through unchanged.
+    """
+    paths = [p for p in redis_client.list_all(f"album_paths:{draft_listing_id}") if isinstance(p, str)]
+    vision = [a for a in redis_client.list_all(f"album_vision:{draft_listing_id}") if isinstance(a, dict)]
+    texts = [str(t).strip() for t in redis_client.list_all(f"album_text:{draft_listing_id}") if str(t).strip()]
+
+    redis_client.delete(f"album_paths:{draft_listing_id}")
+    redis_client.delete(f"album_vision:{draft_listing_id}")
+    redis_client.delete(f"album_text:{draft_listing_id}")
+
+    # The seller's description rides on whichever photo they typed it with - usually the
+    # first, which is never the webhook that ends up replying. Without carrying it across,
+    # the reply asks for details the seller has already given.
+    return (
+        paths or media_paths,
+        vision or vision_analyses,
+        "\n".join(texts) if texts else body,
+    )
 
 
 def _extract_last_media_context(history: List[dict]) -> tuple[Optional[str], List[str]]:
@@ -1125,8 +1179,17 @@ async def whatsapp_webhook(
     structured_prefill: Dict[str, str] = {}
     draft_listing_id: Optional[str] = None
 
+    album_ticket = 0
+    album_started = 0.0
+
     if has_media:
         logger.info(f"📸 Media attached count: {len(media_items)}")
+        # Take the debounce ticket before the upload, not after. Downloading the photo,
+        # storing it and running vision already takes a couple of seconds, and the later
+        # photos of an album arrive during that work - so most of the debounce window is
+        # spent doing something useful and the wait below usually comes out at zero.
+        album_ticket = redis_client.counter(f"album_seq:{phone_number}")
+        album_started = time.monotonic()
         # The draft id used to be recovered by parsing it back out of a chat-history
         # string, which is written only after a photo finishes uploading. WhatsApp sends
         # each photo of an album as its own concurrent webhook, so every photo read the
@@ -1177,39 +1240,89 @@ async def whatsapp_webhook(
 
         # If any image was blocked, inform user and abort this request
         if blocked_any:
+            # This photo answers for itself and never reaches the album step, so it gives
+            # its debounce ticket back. Otherwise it would keep the highest number while
+            # the rest of the album waits in silence for a reply it will never send.
+            if media_paths:
+                album_contribute(draft_listing_id, media_paths, vision_analyses, Body)
+            redis_client.counter_release(f"album_seq:{phone_number}")
             send_twilio_message(phone_number, blocked_reason_msg)
             add_to_conversation_history(phone_number, "assistant", blocked_reason_msg)
             resp = MessagingResponse()
             return Response(content=str(resp), media_type="application/xml")
 
         if uploaded_any and media_paths:
-            # Build vision summary for conversation context
-            vision_summary = ""
-            for idx, analysis in enumerate(vision_analyses, 1):
-                product = analysis.get("product", "")
-                condition = analysis.get("condition", "")
-                features = analysis.get("features", [])
-                if product:
-                    vision_summary += f"\n📷 Fotoğraf {idx}: {product}"
-                if condition:
-                    vision_summary += f" - {condition}"
-                if features and isinstance(features, list):
-                    vision_summary += f" | Özellikler: {', '.join(features[:3])}"
-            
-            # Add vision analysis to conversation history
-            if vision_summary:
-                vision_note = f"[VISION_ANALYSIS]{vision_summary}"
-                add_to_conversation_history(phone_number, "assistant", vision_note)
-
-            # Deterministic user-facing intro (shown before assistant response)
-            vision_intro_for_user = build_vision_intro(vision_analyses)
-            structured_prefill = build_structured_prefill_from_vision(vision_analyses)
-            
-            media_note = f"[SYSTEM_MEDIA_NOTE] DRAFT_LISTING_ID={draft_listing_id} | MEDIA_PATHS={media_paths}"
-            add_to_conversation_history(phone_number, "assistant", media_note)
+            # Contribute this webhook's pieces to the album, then let the debounce below
+            # decide which webhook actually answers. Nothing is written to the chat history
+            # here: four photos would leave four partial notes, each describing one picture,
+            # and the agent would read them as four separate things being sold.
+            album_contribute(draft_listing_id, media_paths, vision_analyses, Body)
         else:
             logger.warning("Media processing failed; continuing without attachment")
             # Optional: notify user about media failure
+
+    # ── Album debounce ────────────────────────────────────────────────────────
+    # WhatsApp delivers each photo of an album as its own webhook, so a four-photo car
+    # produced four separate replies, each analysing one picture and asking again for the
+    # price and location the seller had already given.
+    #
+    # Each media webhook took a ticket on arrival. Here it waits out whatever is left of
+    # the window, then checks whether a later photo arrived. All but the last fall silent;
+    # the last answers once, using the photos, vision results and text of the whole album.
+    #
+    # The wait is what is LEFT of the window, so the seconds already spent uploading and
+    # analysing the photo count towards it and the reply is not delayed twice. That keeps
+    # the round trip clear of Twilio's 15s webhook timeout.
+    if has_media and draft_listing_id:
+        remaining = MEDIA_DEBOUNCE_SECONDS - (time.monotonic() - album_started)
+        if remaining > 0:
+            await asyncio.sleep(remaining)
+
+        if redis_client.counter_value(f"album_seq:{phone_number}") != album_ticket:
+            logger.info(
+                f"🖼️ Album debounce: photo {album_ticket} superseded, staying silent "
+                f"(waited {max(0.0, remaining):.1f}s)"
+            )
+            send_typing_indicator(phone_number, False)
+            return Response(content=str(MessagingResponse()), media_type="application/xml")
+
+        # Last one standing: answer for the whole album.
+        media_paths, vision_analyses, Body = album_collect(
+            draft_listing_id, media_paths, vision_analyses, Body
+        )
+        logger.info(
+            f"🖼️ Album complete: {len(media_paths)} photo(s), "
+            f"{len(vision_analyses)} analysis(es), text={len(Body or '')} chars"
+        )
+
+    if has_media and media_paths:
+        vision_intro_for_user = build_vision_intro(vision_analyses)
+        structured_prefill = build_structured_prefill_from_vision(vision_analyses)
+
+        # One note per album rather than one per photo, written by whichever webhook
+        # survived the debounce, so the history describes a single item with several
+        # pictures instead of several items with one picture each.
+        vision_summary = ""
+        for idx, analysis in enumerate(vision_analyses, 1):
+            product = analysis.get("product", "")
+            condition = analysis.get("condition", "")
+            features = analysis.get("features", [])
+            if product:
+                vision_summary += f"\n📷 Fotoğraf {idx}: {product}"
+            if condition:
+                vision_summary += f" - {condition}"
+            if features and isinstance(features, list):
+                vision_summary += f" | Özellikler: {', '.join(features[:3])}"
+        if vision_summary:
+            add_to_conversation_history(
+                phone_number, "assistant", f"[VISION_ANALYSIS]{vision_summary}"
+            )
+
+        add_to_conversation_history(
+            phone_number,
+            "assistant",
+            f"[SYSTEM_MEDIA_NOTE] DRAFT_LISTING_ID={draft_listing_id} | MEDIA_PATHS={media_paths}",
+        )
 
     # Only send media paths/draft id when this request actually contained media
     payload_media_paths = media_paths if has_media else None

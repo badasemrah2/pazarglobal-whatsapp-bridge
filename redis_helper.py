@@ -84,6 +84,82 @@ class SimpleRedisClient:
             logger.error(f"Redis get_or_set error: {e}")
             return value
 
+    def list_append(self, key: str, value: Any, ttl: int = 1800) -> None:
+        """Append to a list. Used to gather the pieces of one WhatsApp album."""
+        try:
+            if self._enabled:
+                self._client.rpush(key, json.dumps(value, ensure_ascii=False))
+                self._client.expire(key, ttl)
+                return
+            _IN_MEMORY_STORE.setdefault(key, []).append(value)
+        except Exception as e:
+            logger.error(f"Redis list_append error: {e}")
+
+    def list_all(self, key: str) -> list:
+        """Read a list appended to by list_append."""
+        try:
+            if self._enabled:
+                raw = self._client.lrange(key, 0, -1) or []
+                out = []
+                for item in raw:
+                    try:
+                        out.append(json.loads(item))
+                    except Exception:
+                        out.append(item)
+                return out
+            value = _IN_MEMORY_STORE.get(key)
+            return list(value) if isinstance(value, list) else []
+        except Exception as e:
+            logger.error(f"Redis list_all error: {e}")
+            return []
+
+    def counter(self, key: str, ttl: int = 120) -> int:
+        """Hand out the next ticket number for `key`.
+
+        Each photo of an album gets one; only the holder of the highest number answers,
+        which is what turns four webhooks into a single reply.
+        """
+        try:
+            if self._enabled:
+                value = self._client.incr(key)
+                self._client.expire(key, ttl)
+                return int(value)
+            value = int(_IN_MEMORY_STORE.get(key, 0)) + 1
+            _IN_MEMORY_STORE[key] = value
+            return value
+        except Exception as e:
+            logger.error(f"Redis counter error: {e}")
+            return 0
+
+    def counter_release(self, key: str) -> int:
+        """Hand a ticket back, so the photo before it becomes the one that answers.
+
+        A photo rejected by moderation replies on its own and never reaches the album
+        step. Without giving its ticket up it would still hold the highest number, and
+        every other photo in the album would fall silent waiting for a reply it is
+        never going to send.
+        """
+        try:
+            if self._enabled:
+                return int(self._client.decr(key))
+            value = max(0, int(_IN_MEMORY_STORE.get(key, 0)) - 1)
+            _IN_MEMORY_STORE[key] = value
+            return value
+        except Exception as e:
+            logger.error(f"Redis counter_release error: {e}")
+            return 0
+
+    def counter_value(self, key: str) -> int:
+        """Current ticket number without taking one."""
+        try:
+            if self._enabled:
+                raw = self._client.get(key)
+                return int(raw) if raw else 0
+            return int(_IN_MEMORY_STORE.get(key, 0))
+        except Exception as e:
+            logger.error(f"Redis counter_value error: {e}")
+            return 0
+
     def delete(self, key: str) -> bool:
         """Delete key"""
         try:
